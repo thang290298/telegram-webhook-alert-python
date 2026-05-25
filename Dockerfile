@@ -1,19 +1,28 @@
-FROM alpine:3.7
+FROM python:3.9-slim
 
-LABEL maintainer "Carlos Augusto Malucelli <malucellicarlos@gmail.com>"
+WORKDIR /prometheus-telegram-alert
 
-RUN apk update \
-                && apk add py3-pip bash gcc python3-dev musl-dev git libffi-dev openssl-dev \
-                && rm -rf /var/cache/apk/* \
-                && git clone https://github.com/thang290298/telegram-webhook-alert-python.git \
-                && pip3 install -r telegram-webhook-alert-python/requirements.txt
+RUN apt update && apt install -y \
+    vim \
+    bash \
+    gcc \
+    python3-dev \
+    libffi-dev \
+    libssl-dev \
+    unzip \
+    curl \
+ && apt clean \
+ && rm -rf /var/lib/apt/lists/* \
+ && addgroup --system appgroup \
+ && adduser --system --ingroup appgroup appuser
 
-WORKDIR /telegram-webhook-alert-python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN chmod +x /telegram-webhook-alert-python/run.sh
+COPY . .
 
-RUN chmod +x /telegram-webhook-alert-python/flaskAlert.py
+RUN chown -R appuser:appgroup /prometheus-telegram-alert
 
-EXPOSE 9119
+USER appuser
 
-ENTRYPOINT ["./run.sh"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "app.flaskAlert:app"]

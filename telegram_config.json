@@ -1,0 +1,15 @@
+{
+  "PRIORITY_LABELS": ["site", "product", "service"],
+
+  "service": {
+    "BOT_TOKEN": "xxxxxxxx",
+    "CHAT_ID": "xxxxxxxx",
+    "MESSAGE_THREAD_ID": "x"
+  },
+
+  "site-provider": {
+    "BOT_TOKEN": "xxxxxxxx",
+    "CHAT_ID": "xxxxxxxx",
+    "MESSAGE_THREAD_ID": "x"
+  }
+}
