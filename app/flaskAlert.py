@@ -9,6 +9,7 @@ from cachetools import TTLCache
 from threading import Lock, Thread
 from collections import defaultdict
 import queue
+import time
 import pytz
 import logging
 import sys
@@ -45,14 +46,15 @@ cache_lock = Lock()
 # Delay between messages to same chat to respect Telegram rate limit (20 msg/min/group)
 SEND_DELAY = 3  # seconds
 
-# Queue holds (bot_token, chat_id, message, thread_id) tuples grouped by chat key
+# Queue holds (bot_token, chat_id, message, thread_id) tuples
 # background_worker drains the queue so HTTP requests return 200 immediately
 alert_queue = queue.Queue()
 
 
 def background_worker():
     """Drain alert_queue in a background thread.
-    Groups by chat, sends sequentially per chat with SEND_DELAY."""
+    Groups by chat, sends sequentially per chat with SEND_DELAY.
+    Never lets the thread die silently on unexpected errors."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -65,26 +67,32 @@ def background_worker():
         except queue.Empty:
             pass
 
-        if items:
-            # Group by (chat_id, thread_id)
+        if not items:
+            # No items -- sleep briefly before next poll (plain thread sleep, no asyncio overhead)
+            time.sleep(0.5)
+            continue
+
+        try:
+            # Group by (chat_id, thread_id) so each chat is throttled independently
             chat_groups = defaultdict(list)
             for item in items:
                 _, chat_id, _, thread_id = item
                 chat_groups[(chat_id, thread_id)].append(item)
 
-            async def send_all_groups():
+            async def send_all_groups(groups):
                 async def send_group(group_items):
                     for i, (bot_token, chat_id, message, thread_id) in enumerate(group_items):
                         await send_telegram_alert(bot_token, chat_id, message, thread_id)
                         if i < len(group_items) - 1:
                             await asyncio.sleep(SEND_DELAY)
 
-                await asyncio.gather(*[send_group(g) for g in chat_groups.values()])
+                await asyncio.gather(*[send_group(g) for g in groups.values()])
 
-            loop.run_until_complete(send_all_groups())
-        else:
-            # No items — sleep briefly before next poll
-            loop.run_until_complete(asyncio.sleep(0.5))
+            loop.run_until_complete(send_all_groups(chat_groups))
+
+        except Exception as e:
+            # Log and continue -- never let the worker thread die silently
+            app.logger.error(f"background_worker error: {e}", exc_info=True)
 
 
 # Start background worker thread (daemon=True so it exits with main process)
@@ -148,9 +156,9 @@ def format_telegram_message(alert, labels, annotations):
         alertname_icon = "✅"
         alertname_suffix = ""
     elif severity == "critical":
-        status_icon = "🚨"
-        alertname_icon = "🚨"
-        alertname_suffix = "🚨🚨🚨"
+        status_icon = "\U0001f6a8"
+        alertname_icon = "\U0001f6a8"
+        alertname_suffix = "\U0001f6a8\U0001f6a8\U0001f6a8"
     elif severity == "warning":
         status_icon = "⚠️"
         alertname_icon = "⚠️"
@@ -276,7 +284,7 @@ def alertmanager_webhook():
     app.logger.info("Webhook called")
     app.logger.debug(f"Received data: {json.dumps(data)}")
 
-    # Enqueue alerts for background processing — return 200 immediately.
+    # Enqueue alerts for background processing -- return 200 immediately.
     # background_worker() drains the queue with rate limiting (SEND_DELAY between msgs).
     # This prevents Gunicorn timeout and AlertManager retries on slow batches.
     queued = 0
