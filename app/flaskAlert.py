@@ -8,6 +8,8 @@ from dateutil import parser
 from cachetools import TTLCache
 from threading import Lock, Thread
 from collections import defaultdict
+from typing import NamedTuple
+import os
 import queue
 import time
 import pytz
@@ -38,15 +40,25 @@ app.logger.setLevel(logging.DEBUG)
 # ================== CHONG ALERT TRUNG ==================
 # TTLCache tu dong xoa entry sau ALERT_REPEAT_INTERVAL giay - khong bi memory leak
 # Lock dam bao thread-safe khi gunicorn dung nhieu threads
-ALERT_REPEAT_INTERVAL = 1800  # giay (30 phut)
-recent_alerts_cache = TTLCache(maxsize=2000, ttl=ALERT_REPEAT_INTERVAL)
+ALERT_REPEAT_INTERVAL = int(os.environ.get('ALERT_REPEAT_INTERVAL', 1800))  # giay (mac dinh 30 phut)
+ALERT_CACHE_MAXSIZE = int(os.environ.get('ALERT_CACHE_MAXSIZE', 20000))
+recent_alerts_cache = TTLCache(maxsize=ALERT_CACHE_MAXSIZE, ttl=ALERT_REPEAT_INTERVAL)
 cache_lock = Lock()
 
 # ================== BACKGROUND SEND QUEUE ==================
 # Delay between messages to same chat to respect Telegram rate limit (20 msg/min/group)
 SEND_DELAY = 3  # seconds
 
-# Queue holds (bot_token, chat_id, message, thread_id) tuples
+class AlertJob(NamedTuple):
+    """Mot don vi cong viec trong queue.
+    Dung NamedTuple thay tuple tran de khong vo khi unpack luc them field."""
+    bot_token: str
+    chat_id: str
+    message: str
+    thread_id: object
+    alert_hash: str
+
+
 # background_worker drains the queue so HTTP requests return 200 immediately
 alert_queue = queue.Queue()
 
@@ -75,14 +87,19 @@ def background_worker():
         try:
             # Group by (chat_id, thread_id) so each chat is throttled independently
             chat_groups = defaultdict(list)
-            for item in items:
-                _, chat_id, _, thread_id = item
-                chat_groups[(chat_id, thread_id)].append(item)
+            for job in items:
+                chat_groups[(job.chat_id, job.thread_id)].append(job)
 
             async def send_all_groups(groups):
                 async def send_group(group_items):
-                    for i, (bot_token, chat_id, message, thread_id) in enumerate(group_items):
-                        await send_telegram_alert(bot_token, chat_id, message, thread_id)
+                    for i, job in enumerate(group_items):
+                        ok = await send_telegram_alert(
+                            job.bot_token, job.chat_id, job.message, job.thread_id
+                        )
+                        if not ok:
+                            # Go dau dedup -> lan retry cua Alertmanager di qua duoc,
+                            # thay vi bi nuot im lang trong ALERT_REPEAT_INTERVAL.
+                            release_alert(job.alert_hash)
                         if i < len(group_items) - 1:
                             await asyncio.sleep(SEND_DELAY)
 
@@ -93,6 +110,10 @@ def background_worker():
         except Exception as e:
             # Log and continue -- never let the worker thread die silently
             app.logger.error(f"background_worker error: {e}", exc_info=True)
+            # Ca batch coi nhu that bai -> tha dau dedup ra.
+            # Danh doi co y: tha trung con hon mat alert.
+            for job in items:
+                release_alert(job.alert_hash)
 
 
 # Start background worker thread (daemon=True so it exits with main process)
@@ -101,36 +122,78 @@ _worker_thread.start()
 # ===========================================================
 
 
-def is_duplicate_alert(alert):
-    labels = alert.get('labels', {})
+def _alert_identity(alert):
+    """Dinh danh duy nhat cua 1 alert.
+    Uu tien 'fingerprint' cua Alertmanager - la hash cua TOAN BO label set.
+    Fallback: serialize toan bo labels, de khong bo sot label nao
+    (vd mountpoint / device / pod / target) khien 2 alert khac nhau
+    bi coi la trung va bi nuot."""
+    fingerprint = alert.get('fingerprint')
+    if fingerprint:
+        return f"fp:{fingerprint}"
+    return "lb:" + json.dumps(alert.get('labels', {}), sort_keys=True)
+
+
+def build_alert_hash(alert):
+    """Tra ve (alert_hash, key_fields).
+    Key gom: identity (full labels) + status + timestamp cua vong doi tuong ung
+    -> chan repeat cua Alertmanager, nhung van cho flapping va resolved di qua."""
     status = alert.get('status', '').lower()
+    raw_ts = alert.get('startsAt') if status == 'firing' else alert.get('endsAt')
 
-    try:
-        starts_at_ts = round(parser.parse(alert.get('startsAt', '')).timestamp()) if 'startsAt' in alert else None
-        ends_at_ts = round(parser.parse(alert.get('endsAt', '')).timestamp()) if 'endsAt' in alert else None
-    except Exception as e:
-        app.logger.warning(f"Failed to parse timestamps: {e}")
-        starts_at_ts = None
-        ends_at_ts = None
+    ts = None
+    if raw_ts:
+        try:
+            ts = round(parser.parse(raw_ts).timestamp())
+        except Exception as e:
+            app.logger.warning(f"Failed to parse timestamp '{raw_ts}': {e}")
 
-    alert_key_fields = {
-        'severity': labels.get('severity'),
-        'instance': labels.get('instance'),
-        'alertname': labels.get('alertname'),
-        'job': labels.get('job'),
+    key_fields = {
+        'identity': _alert_identity(alert),
         'status': status,
-        'timestamp': starts_at_ts if status == 'firing' else ends_at_ts
+        'timestamp': ts
     }
+    alert_hash = md5(json.dumps(key_fields, sort_keys=True).encode()).hexdigest()
+    return alert_hash, key_fields
 
-    alert_id = json.dumps(alert_key_fields, sort_keys=True)
-    alert_hash = md5(alert_id.encode()).hexdigest()
+
+def reserve_alert(alert):
+    """Tra ve (is_duplicate, alert_hash).
+    Danh dau alert ngay khi nhan de chan trung trong cung 1 burst;
+    neu gui that bai, background_worker goi release_alert() de tha ra."""
+    alert_hash, key_fields = build_alert_hash(alert)
 
     with cache_lock:
         if alert_hash in recent_alerts_cache:
-            app.logger.info(f"Duplicate alert ({status}) detected: {alert_key_fields}")
-            return True
+            app.logger.info(
+                f"Duplicate alert ({key_fields['status']}) skipped: {key_fields['identity']}"
+            )
+            return True, alert_hash
+
         recent_alerts_cache[alert_hash] = True
-    return False
+
+        if len(recent_alerts_cache) >= ALERT_CACHE_MAXSIZE * 0.9:
+            app.logger.warning(
+                f"Dedup cache near capacity ({len(recent_alerts_cache)}/{ALERT_CACHE_MAXSIZE})"
+                " - entries may be evicted before TTL, duplicates can slip through"
+            )
+
+    return False, alert_hash
+
+
+def release_alert(alert_hash):
+    """Go dau dedup khi gui that bai, de Alertmanager retry di qua duoc."""
+    if not alert_hash:
+        return
+    with cache_lock:
+        recent_alerts_cache.pop(alert_hash, None)
+
+
+# De scale nhieu worker / giu cache qua restart, thay TTLCache bang Redis:
+#   reserve: redis_client.set(alert_hash, "1", nx=True, ex=ALERT_REPEAT_INTERVAL) is not None
+#   release: redis_client.delete(alert_hash)
+# SET NX EX la atomic nen bo luon duoc cache_lock, va gunicorn.conf.py
+# khi do moi bo duoc rang buoc workers=1.
 
 # ================================================================
 
@@ -289,8 +352,9 @@ def alertmanager_webhook():
     # This prevents Gunicorn timeout and AlertManager retries on slow batches.
     queued = 0
     for alert in data['alerts']:
-        if is_duplicate_alert(alert):
-            app.logger.info("Duplicate alert detected. Skip sending.")
+        # reserve_alert() da log chi tiet khi trung -> khong log lap o day
+        is_dup, alert_hash = reserve_alert(alert)
+        if is_dup:
             continue
 
         labels = alert.get('labels', {})
@@ -308,7 +372,7 @@ def alertmanager_webhook():
             thread_id = mapping.get('MESSAGE_THREAD_ID', thread_id)
 
         message = format_telegram_message(alert, labels, annotations)
-        alert_queue.put((bot_token, chat_id, message, thread_id))
+        alert_queue.put(AlertJob(bot_token, chat_id, message, thread_id, alert_hash))
         queued += 1
 
     app.logger.info(f"Queued {queued} alert(s) for background sending")
