@@ -330,17 +330,21 @@ def safe_code(text):
     return str(text).replace('\\', '\\\\').replace('`', '\\`')
 
 
-def _code_block(text):
-    """Inline code cho chuoi mot dong, pre-block cho chuoi nhieu dong.
+def _render_value(text):
+    """Tra ve (kieu, chuoi da escape) cho mot gia tri annotation.
 
-    MarkdownV2 KHONG cho phep xuong dong trong inline code. Annotation
-    'description' cua Alertmanager rat hay nhieu dong -> ban cu bi Telegram
-    tra ve 400 'can't parse entities' va alert khong bao gio den noi.
+    - Mot dong  -> 'inline': boc trong `code` cho de doc.
+    - Nhieu dong-> 'block' : text thuong da escape, giu nguyen xuong dong.
+
+    KHONG dung pre-block ``` cho chuoi nhieu dong: Telegram render no thanh
+    mot khung lon kem nut 'copy', doc alert rat roi. Cung khong dung inline
+    code vi MarkdownV2 cam xuong dong trong inline code -> Telegram tra ve
+    400 'can't parse entities' va alert khong bao gio den noi.
     """
-    escaped = safe_code(text)
-    if '\n' in escaped:
-        return f"```\n{escaped}\n```"
-    return f"`{escaped}`"
+    text = str(text)
+    if '\n' in text:
+        return 'block', escape_md2(text.strip('\n'))
+    return 'inline', safe_code(text)
 
 
 def format_telegram_message(alert, labels, annotations):
@@ -376,11 +380,11 @@ def format_telegram_message(alert, labels, annotations):
         value = annotations.get(field)
         if value in (None, ''):
             continue
-        block = _code_block(value)
-        if block.startswith('```'):
-            message_lines.append(f"*{title}:*\n{block}")
+        kind, rendered = _render_value(value)
+        if kind == 'block':
+            message_lines.append(f"*{title}:*\n{rendered}")
         else:
-            message_lines.append(f"*{title}:* {block}")
+            message_lines.append(f"*{title}:* `{rendered}`")
 
     raw_ts = alert.get('endsAt') if status == 'resolved' else alert.get('startsAt')
     label = 'Resolved' if status == 'resolved' else 'Started'
@@ -392,7 +396,7 @@ def format_telegram_message(alert, labels, annotations):
             message_lines.append(f"*{label}:* `{correct_date}`")
         except Exception as e:
             app.logger.warning(f"Failed to format timestamp '{raw_ts}': {e}")
-            message_lines.append(f"*{label}:* {_code_block(raw_ts)}")
+            message_lines.append(f"*{label}:* `{safe_code(raw_ts)}`")
 
     return '\n'.join(message_lines)
 

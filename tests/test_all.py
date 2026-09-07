@@ -109,7 +109,8 @@ msg = fa.format_telegram_message(
     {"alertname": "Disk-Full", "severity": "critical"},
     {"description": multi, "summary": "one line"},
 )
-check("description nhieu dong dung pre-block (bug #3)", "```\nline1\nline2\nline3\n```" in msg, msg)
+check("description nhieu dong: text thuong, KHONG dung pre-block ```",
+      "```" not in msg and "line1\nline2\nline3" in msg, msg)
 check("summary mot dong van dung inline code", "*Summary:* `one line`" in msg, msg)
 check("alertname duoc escape", "Disk\\-Full" in msg, msg)
 check("timestamp doi ve gio VN", "2026-09-07 17:00:00" in msg, msg)

@@ -1,15 +1,4 @@
 {
-  "_": "File mau. Copy thanh telegram_config.json roi thay token/chat that.",
-  "_ghi_chu": [
-    "Key bat dau bang '_' la ghi chu, bot bo qua hoan toan.",
-    "PRIORITY_LABELS: chi nhung label nay duoc dung de match.",
-    "Rule nhieu dieu kien hon duoc uu tien truoc.",
-    "Khong rule nao khop -> DEFAULT_BOT_TOKEN / DEFAULT_CHAT_ID.",
-    "MESSAGE_THREAD_ID tuy chon; bo qua -> DEFAULT_MESSAGE_THREAD_ID.",
-    "Gui 1 alert den NHIEU group: dung 'targets': [...] hoac 'continue': true.",
-    "Doi file nay phai restart container."
-  ],
-
   "PRIORITY_LABELS": ["site", "service", "role", "severity", "product"],
 
   "rules": {

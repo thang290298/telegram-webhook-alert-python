@@ -278,7 +278,15 @@ curl -s http://127.0.0.1:9119/health | jq
 
 **Queue đầy** (`QUEUE_MAXSIZE`): drop alert + log ERROR + thả dấu dedup, thay vì phình bộ nhớ đến khi OOM.
 
-**Message nhiều dòng:** annotation có xuống dòng được bọc trong pre-block ```` ``` ````; một dòng thì dùng inline code. MarkdownV2 không cho phép newline trong inline code — đây là nguyên nhân của lỗi `can't parse entities` khi description dài.
+**Message nhiều dòng:** annotation một dòng dùng inline code; annotation nhiều dòng render thành text thường đã escape, giữ nguyên xuống dòng. Không dùng pre-block ```` ``` ```` vì Telegram hiện thêm khung lớn kèm nút "copy", đọc alert rất rối. Cũng không dùng inline code cho chuỗi nhiều dòng — MarkdownV2 cấm newline trong inline code, đây là nguyên nhân lỗi `can't parse entities` khi description dài.
+
+**Công cụ debug trong container:** `vim`, `telnet`, `nc`, `curl`.
+
+```bash
+docker exec -it telegram-bot bash
+cat telegram_config.json
+nc -zv api.telegram.org 443
+```
 
 ---
 

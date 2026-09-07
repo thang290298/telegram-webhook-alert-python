@@ -24,7 +24,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /prometheus-telegram-alert
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        curl \
+        vim \
+        bash \
+        unzip \
+        curl \
+        netcat-openbsd \
+ && (apt-get install -y --no-install-recommends telnet \
+     || apt-get install -y --no-install-recommends inetutils-telnet) \
  && rm -rf /var/lib/apt/lists/* \
  && addgroup --system appgroup \
  && adduser --system --ingroup appgroup appuser
