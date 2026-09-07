@@ -1,0 +1,18 @@
+{
+  "PRIORITY_LABELS": ["site", "product", "service"],
+
+  "rules": {
+    "storage-hpg": {
+      "match": { "site": "hpg", "product": "storage" },
+      "BOT_TOKEN": "111111:AAAA",
+      "CHAT_ID": "-100111111",
+      "MESSAGE_THREAD_ID": "5"
+    },
+
+    "network-all-sites": {
+      "match": { "product": "network" },
+      "BOT_TOKEN": "222222:BBBB",
+      "CHAT_ID": "-100222222"
+    }
+  }
+}

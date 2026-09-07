@@ -1,8 +1,19 @@
 .git
 .gitignore
+.github
 __pycache__
+**/__pycache__
 *.pyc
 *.pyo
 *.pyd
 .env
 *.md
+.venv
+venv
+.pytest_cache
+tests
+
+# Khong dong goi config that vao image - phai mount luc runtime.
+# Neu thieu file, config.py log WARNING va chay che do "khong mapping",
+# tat ca alert ve DEFAULT bot; an toan hon la nhung token placeholder.
+telegram_config.json

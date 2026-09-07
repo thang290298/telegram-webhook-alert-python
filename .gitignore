@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# Config that chua BOT_TOKEN - khong bao gio commit.
+# Dung telegram_config.example.json lam mau.
+telegram_config.json

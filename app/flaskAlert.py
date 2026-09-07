@@ -1,41 +1,77 @@
-from flask import Flask, request, jsonify
-from app.auth import auth
-from config import *
-from telegram import Bot
-from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TimedOut, NetworkError
-from dateutil import parser
-from cachetools import TTLCache
-from threading import Lock, Thread
-from collections import defaultdict
-from typing import NamedTuple
+import asyncio
+import json
+import logging
 import os
 import queue
-import time
-import pytz
-import logging
-import sys
-import json
-import asyncio
 import re
+import sys
+import time
+from collections import defaultdict
 from hashlib import md5
+from threading import Lock, Thread
+from typing import NamedTuple
 
-app = Flask(__name__)
+import pytz
+from cachetools import TTLCache
+from dateutil import parser
+from flask import jsonify, request
+from telegram import Bot
+from telegram.constants import ParseMode
+from telegram.error import (
+    BadRequest,
+    ChatMigrated,
+    Forbidden,
+    InvalidToken,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 
-# Logging config
-log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
-stdout_handler = logging.StreamHandler(sys.stdout)
-stderr_handler = logging.StreamHandler(sys.stderr)
+from app import app
+from app.auth import auth
+from config import (
+    DEFAULT_BOT_TOKEN,
+    DEFAULT_CHAT_ID,
+    DEFAULT_MESSAGE_THREAD_ID,
+    RULES,
+    find_rule,
+)
 
-stdout_handler.setLevel(logging.DEBUG)
-stderr_handler.setLevel(logging.ERROR)
+# ================== LOGGING ==================
+# Truoc day stdout_handler (level DEBUG) va stderr_handler (level ERROR) cung
+# gan vao app.logger -> moi dong ERROR bi in HAI lan. Gio stdout chi nhan
+# < ERROR, stderr nhan >= ERROR, va tat propagate de khong dup qua root logger.
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+# Log nguyen payload webhook rat to va co the chua thong tin nhay cam -> mac dinh tat.
+LOG_PAYLOAD = os.environ.get('LOG_PAYLOAD', '').strip().lower() in ('1', 'true', 'yes')
 
-stdout_handler.setFormatter(log_formatter)
-stderr_handler.setFormatter(log_formatter)
 
-app.logger.addHandler(stdout_handler)
-app.logger.addHandler(stderr_handler)
-app.logger.setLevel(logging.DEBUG)
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, level):
+        super().__init__()
+        self.level = level
+
+    def filter(self, record):
+        return record.levelno < self.level
+
+
+_log_formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.DEBUG)
+_stdout_handler.addFilter(_MaxLevelFilter(logging.ERROR))
+_stdout_handler.setFormatter(_log_formatter)
+
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.ERROR)
+_stderr_handler.setFormatter(_log_formatter)
+
+app.logger.handlers.clear()
+app.logger.addHandler(_stdout_handler)
+app.logger.addHandler(_stderr_handler)
+app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+app.logger.propagate = False
 
 # ================== CHONG ALERT TRUNG ==================
 # TTLCache tu dong xoa entry sau ALERT_REPEAT_INTERVAL giay - khong bi memory leak
@@ -45,9 +81,25 @@ ALERT_CACHE_MAXSIZE = int(os.environ.get('ALERT_CACHE_MAXSIZE', 20000))
 recent_alerts_cache = TTLCache(maxsize=ALERT_CACHE_MAXSIZE, ttl=ALERT_REPEAT_INTERVAL)
 cache_lock = Lock()
 
+_capacity_warn_lock = Lock()
+_last_capacity_warn = 0.0
+CAPACITY_WARN_INTERVAL = 60  # giay - chong spam log khi cache day
+
 # ================== BACKGROUND SEND QUEUE ==================
-# Delay between messages to same chat to respect Telegram rate limit (20 msg/min/group)
-SEND_DELAY = 3  # seconds
+# Delay giua 2 message vao cung mot chat de ton trong rate limit cua Telegram
+# (20 msg/phut/group).
+SEND_DELAY = float(os.environ.get('SEND_DELAY', 3))
+# Queue co gioi han: neu Telegram chet lau + alert storm thi queue khong duoc
+# phinh vo han den muc OOM. Vuot han -> tra dau dedup va log, de Alertmanager retry.
+QUEUE_MAXSIZE = int(os.environ.get('QUEUE_MAXSIZE', 5000))
+# Chan so job xu ly trong mot batch, de mot burst khong lam batch qua lon.
+MAX_BATCH = int(os.environ.get('MAX_BATCH', 200))
+
+# Ket qua gui: quyet dinh co tha dau dedup ra hay khong.
+SEND_OK = 'ok'          # gui thanh cong
+SEND_RETRY = 'retry'    # loi tam thoi -> tha dedup de Alertmanager retry di qua
+SEND_DROP = 'drop'      # loi vinh vien -> GIU dedup, retry cung se fail y het
+
 
 class AlertJob(NamedTuple):
     """Mot don vi cong viec trong queue.
@@ -59,65 +111,111 @@ class AlertJob(NamedTuple):
     alert_hash: str
 
 
-# background_worker drains the queue so HTTP requests return 200 immediately
-alert_queue = queue.Queue()
+alert_queue: "queue.Queue[AlertJob]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+# ================== BOT POOL ==================
+# Truoc day moi alert tao mot Bot() moi. Bot cua PTB v21 mo mot HTTPX
+# connection pool rieng va khong bao gio duoc shutdown -> ro socket/FD tren
+# tien trinh chay dai ngay. Gio cache theo token, tao dung mot lan.
+_bots = {}
+
+
+async def _get_bot(token):
+    bot = _bots.get(token)
+    if bot is None:
+        bot = Bot(token=token)
+        await bot.initialize()
+        _bots[token] = bot
+    return bot
+
+
+# ================== RATE LIMIT XUYEN BATCH ==================
+# Truoc day SEND_DELAY chi ap trong pham vi mot lan drain queue: batch moi den
+# ngay sau do se gui tuc thi -> van co the vuot 20 msg/phut. Gio nho moc thoi
+# gian gui cuoi cung theo tung chat va cho bu phan con thieu.
+_last_sent = {}
+_LAST_SENT_MAXSIZE = 2000
+
+
+async def _throttle(chat_key):
+    last = _last_sent.get(chat_key)
+    if last is not None:
+        wait = SEND_DELAY - (time.monotonic() - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+    _last_sent[chat_key] = time.monotonic()
+
+    if len(_last_sent) > _LAST_SENT_MAXSIZE:
+        cutoff = time.monotonic() - max(SEND_DELAY * 10, 60)
+        for key in [k for k, v in _last_sent.items() if v < cutoff]:
+            _last_sent.pop(key, None)
+
+
+def _drain_queue():
+    """Cho job dau tien (blocking co timeout - khong busy-poll), roi vet not
+    nhung job dang cho, toi da MAX_BATCH."""
+    items = []
+    try:
+        items.append(alert_queue.get(timeout=0.5))
+    except queue.Empty:
+        return items
+
+    try:
+        while len(items) < MAX_BATCH:
+            items.append(alert_queue.get_nowait())
+    except queue.Empty:
+        pass
+    return items
+
+
+async def _send_group(jobs, handled):
+    """Gui tuan tu cac job cua cung mot (chat_id, thread_id)."""
+    for job in jobs:
+        await _throttle((job.chat_id, job.thread_id))
+        result = await send_telegram_alert(
+            job.bot_token, job.chat_id, job.message, job.thread_id
+        )
+        handled.add(job.alert_hash)
+        if result == SEND_RETRY:
+            # Go dau dedup -> lan retry cua Alertmanager di qua duoc,
+            # thay vi bi nuot im lang trong ALERT_REPEAT_INTERVAL.
+            release_alert(job.alert_hash)
+
+
+async def _process_batch(items, handled):
+    # Group theo (chat_id, thread_id) de moi chat duoc throttle doc lap
+    chat_groups = defaultdict(list)
+    for job in items:
+        chat_groups[(job.chat_id, job.thread_id)].append(job)
+
+    await asyncio.gather(*[_send_group(g, handled) for g in chat_groups.values()])
 
 
 def background_worker():
-    """Drain alert_queue in a background thread.
-    Groups by chat, sends sequentially per chat with SEND_DELAY.
-    Never lets the thread die silently on unexpected errors."""
+    """Drain alert_queue trong mot thread rieng.
+    Khong bao gio de thread chet im lang truoc loi bat ngo."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     while True:
-        # Collect all currently queued items (non-blocking drain)
-        items = []
-        try:
-            while True:
-                items.append(alert_queue.get_nowait())
-        except queue.Empty:
-            pass
-
+        items = _drain_queue()
         if not items:
-            # No items -- sleep briefly before next poll (plain thread sleep, no asyncio overhead)
-            time.sleep(0.5)
             continue
 
+        handled = set()
         try:
-            # Group by (chat_id, thread_id) so each chat is throttled independently
-            chat_groups = defaultdict(list)
-            for job in items:
-                chat_groups[(job.chat_id, job.thread_id)].append(job)
-
-            async def send_all_groups(groups):
-                async def send_group(group_items):
-                    for i, job in enumerate(group_items):
-                        ok = await send_telegram_alert(
-                            job.bot_token, job.chat_id, job.message, job.thread_id
-                        )
-                        if not ok:
-                            # Go dau dedup -> lan retry cua Alertmanager di qua duoc,
-                            # thay vi bi nuot im lang trong ALERT_REPEAT_INTERVAL.
-                            release_alert(job.alert_hash)
-                        if i < len(group_items) - 1:
-                            await asyncio.sleep(SEND_DELAY)
-
-                await asyncio.gather(*[send_group(g) for g in groups.values()])
-
-            loop.run_until_complete(send_all_groups(chat_groups))
-
+            loop.run_until_complete(_process_batch(items, handled))
         except Exception as e:
-            # Log and continue -- never let the worker thread die silently
             app.logger.error(f"background_worker error: {e}", exc_info=True)
-            # Ca batch coi nhu that bai -> tha dau dedup ra.
-            # Danh doi co y: tha trung con hon mat alert.
+            # Chi tha dau dedup cua nhung job CHUA duoc xu ly. Ban cu tha ca
+            # batch, ke ca job da gui thanh cong -> alert bi gui trung.
             for job in items:
-                release_alert(job.alert_hash)
+                if job.alert_hash not in handled:
+                    release_alert(job.alert_hash)
 
 
 # Start background worker thread (daemon=True so it exits with main process)
-_worker_thread = Thread(target=background_worker, daemon=True)
+_worker_thread = Thread(target=background_worker, name='alert-sender', daemon=True)
 _worker_thread.start()
 # ===========================================================
 
@@ -131,14 +229,17 @@ def _alert_identity(alert):
     fingerprint = alert.get('fingerprint')
     if fingerprint:
         return f"fp:{fingerprint}"
-    return "lb:" + json.dumps(alert.get('labels', {}), sort_keys=True)
+    labels = alert.get('labels')
+    if not isinstance(labels, dict):
+        labels = {}
+    return "lb:" + json.dumps(labels, sort_keys=True, default=str)
 
 
 def build_alert_hash(alert):
     """Tra ve (alert_hash, key_fields).
     Key gom: identity (full labels) + status + timestamp cua vong doi tuong ung
     -> chan repeat cua Alertmanager, nhung van cho flapping va resolved di qua."""
-    status = alert.get('status', '').lower()
+    status = str(alert.get('status', '')).lower()
     raw_ts = alert.get('startsAt') if status == 'firing' else alert.get('endsAt')
 
     ts = None
@@ -157,6 +258,20 @@ def build_alert_hash(alert):
     return alert_hash, key_fields
 
 
+def _warn_capacity(current):
+    """Canh bao cache gan day, toi da 1 lan / CAPACITY_WARN_INTERVAL giay."""
+    global _last_capacity_warn
+    now = time.monotonic()
+    with _capacity_warn_lock:
+        if now - _last_capacity_warn < CAPACITY_WARN_INTERVAL:
+            return
+        _last_capacity_warn = now
+    app.logger.warning(
+        f"Dedup cache near capacity ({current}/{ALERT_CACHE_MAXSIZE})"
+        " - entries may be evicted before TTL, duplicates can slip through"
+    )
+
+
 def reserve_alert(alert):
     """Tra ve (is_duplicate, alert_hash).
     Danh dau alert ngay khi nhan de chan trung trong cung 1 burst;
@@ -171,12 +286,10 @@ def reserve_alert(alert):
             return True, alert_hash
 
         recent_alerts_cache[alert_hash] = True
+        current = len(recent_alerts_cache)
 
-        if len(recent_alerts_cache) >= ALERT_CACHE_MAXSIZE * 0.9:
-            app.logger.warning(
-                f"Dedup cache near capacity ({len(recent_alerts_cache)}/{ALERT_CACHE_MAXSIZE})"
-                " - entries may be evicted before TTL, duplicates can slip through"
-            )
+    if current >= ALERT_CACHE_MAXSIZE * 0.9:
+        _warn_capacity(current)
 
     return False, alert_hash
 
@@ -204,15 +317,29 @@ def escape_md2(text):
 
 
 def safe_code(text):
-    """Prepare text for inline code span in MarkdownV2.
-    Replace backtick with single-quote to avoid breaking the code span."""
-    return str(text).replace('`', "'").replace('\\', '\\\\')
+    """Escape noi dung nam trong code / pre entity cua MarkdownV2.
+    Theo spec Telegram: trong code va pre, ca '`' va '\\' deu phai duoc escape.
+    Ban cu thay '`' bang nhay don - lam sai lech noi dung alert."""
+    return str(text).replace('\\', '\\\\').replace('`', '\\`')
+
+
+def _code_block(text):
+    """Inline code cho chuoi mot dong, pre-block cho chuoi nhieu dong.
+
+    MarkdownV2 KHONG cho phep xuong dong trong inline code. Annotation
+    'description' cua Alertmanager rat hay nhieu dong -> ban cu bi Telegram
+    tra ve 400 'can't parse entities' va alert khong bao gio den noi.
+    """
+    escaped = safe_code(text)
+    if '\n' in escaped:
+        return f"```\n{escaped}\n```"
+    return f"`{escaped}`"
 
 
 def format_telegram_message(alert, labels, annotations):
-    status = alert['status'].lower()
-    severity = labels.get('severity', '').lower()
-    status_text = alert['status'].upper()
+    status = str(alert.get('status', '')).lower()
+    severity = str(labels.get('severity', '')).lower()
+    status_text = str(alert.get('status', 'UNKNOWN')).upper()
 
     if status == "resolved":
         status_icon = "✅"
@@ -234,41 +361,47 @@ def format_telegram_message(alert, labels, annotations):
     alertname = escape_md2(labels.get('alertname', 'N/A'))
 
     message_lines = [
-        f"*Status:* {status_icon} {status_text} {status_icon}",
+        f"*Status:* {status_icon} {escape_md2(status_text)} {status_icon}",
         f"*Alertname:* {alertname_icon} {alertname}{alertname_suffix}"
     ]
 
-    if 'info' in annotations:
-        message_lines.append(f"*Info:* `{safe_code(annotations['info'])}`")
-    if 'summary' in annotations:
-        message_lines.append(f"*Summary:* `{safe_code(annotations['summary'])}`")
-    if 'description' in annotations:
-        message_lines.append(f"*Description:* `{safe_code(annotations['description'])}`")
+    for field, title in (('info', 'Info'), ('summary', 'Summary'), ('description', 'Description')):
+        value = annotations.get(field)
+        if value in (None, ''):
+            continue
+        block = _code_block(value)
+        if block.startswith('```'):
+            message_lines.append(f"*{title}:*\n{block}")
+        else:
+            message_lines.append(f"*{title}:* {block}")
 
-    try:
-        if status == "resolved":
-            correct_date = parser.parse(alert['endsAt']).astimezone(
+    raw_ts = alert.get('endsAt') if status == 'resolved' else alert.get('startsAt')
+    label = 'Resolved' if status == 'resolved' else 'Started'
+    if raw_ts and status in ('firing', 'resolved'):
+        try:
+            correct_date = parser.parse(raw_ts).astimezone(
                 pytz.timezone('Asia/Bangkok')
             ).strftime('%Y-%m-%d %H:%M:%S')
-            message_lines.append(f"*Resolved:* `{correct_date}`")
-        elif status == "firing":
-            correct_date = parser.parse(alert['startsAt']).astimezone(
-                pytz.timezone('Asia/Bangkok')
-            ).strftime('%Y-%m-%d %H:%M:%S')
-            message_lines.append(f"*Started:* `{correct_date}`")
-    except Exception as e:
-        message_lines.append(f"*Date parse error:* `{safe_code(str(e))}`")
+            message_lines.append(f"*{label}:* `{correct_date}`")
+        except Exception as e:
+            app.logger.warning(f"Failed to format timestamp '{raw_ts}': {e}")
+            message_lines.append(f"*{label}:* {_code_block(raw_ts)}")
 
     return '\n'.join(message_lines)
 
 
 async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_retries=3):
-    """Send alert to Telegram. Retry up to max_retries times using a loop (no recursion)."""
+    """Gui alert den Telegram. Tra ve SEND_OK / SEND_RETRY / SEND_DROP.
+
+    Phan biet loi tam thoi (mang, flood control) voi loi vinh vien (400 sai
+    markup, 403 bot bi kick, token sai). Ban cu coi tat ca la that bai roi tha
+    dau dedup -> Alertmanager retry -> lai fail y het -> vong lap vo han.
+    """
     if not bot_token or not chat_id:
         app.logger.error("bot_token or chat_id is None - Skip sending message")
-        return False
+        return SEND_DROP
 
-    # Validate thread_id before entering retry loop to avoid uncaught ValueError
+    # Validate thread_id truoc khi vao vong retry de khong nem ValueError
     thread_id_int = None
     if thread_id is not None:
         try:
@@ -276,11 +409,19 @@ async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_r
         except (ValueError, TypeError) as e:
             app.logger.error(f"Invalid MESSAGE_THREAD_ID '{thread_id}': {e} - sending without thread")
 
-    bot = Bot(token=bot_token)
+    try:
+        bot = await _get_bot(bot_token)
+    except InvalidToken as e:
+        app.logger.error(f"Invalid bot token: {e} - drop alert, khong retry")
+        return SEND_DROP
+    except Exception as e:
+        app.logger.error(f"Cannot init bot: {e}")
+        return SEND_RETRY
+
     send_kwargs = {
         'chat_id': chat_id,
         'text': message,
-        'parse_mode': ParseMode.MARKDOWN_V2
+        'parse_mode': ParseMode.MARKDOWN_V2,
     }
     if thread_id_int is not None:
         send_kwargs['message_thread_id'] = thread_id_int
@@ -289,7 +430,7 @@ async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_r
         try:
             await bot.send_message(**send_kwargs)
             app.logger.info(f"Sent alert to chat_id {chat_id} success")
-            return True
+            return SEND_OK
 
         except RetryAfter as e:
             wait_time = e.retry_after
@@ -308,76 +449,144 @@ async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_r
             if attempt < max_retries:
                 await asyncio.sleep(3)
 
+        except ChatMigrated as e:
+            app.logger.error(
+                f"chat_id {chat_id} da migrate sang {e.new_chat_id} - "
+                "cap nhat CHAT_ID trong config. Drop alert, khong retry"
+            )
+            return SEND_DROP
+
+        except (BadRequest, Forbidden, InvalidToken) as e:
+            # 400 (markup/chat sai), 403 (bot bi kick / chua duoc add vao group),
+            # token sai: retry bao nhieu lan cung fail y het.
+            app.logger.error(
+                f"Permanent Telegram error for chat_id {chat_id}: {e} - drop alert, khong retry"
+            )
+            return SEND_DROP
+
+        except TelegramError as e:
+            app.logger.warning(
+                f"Telegram error: {e}. Retry in 3s (attempt {attempt}/{max_retries})"
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(3)
+
         except Exception as e:
-            app.logger.error(f"Failed to send alert: {str(e)}")
-            return False
+            app.logger.error(f"Failed to send alert: {e}", exc_info=True)
+            return SEND_RETRY
 
     app.logger.error(f"Failed to send alert to chat_id {chat_id} after {max_retries} attempts")
-    return False
+    return SEND_RETRY
 
 
-def find_mapping_from_labels(labels):
-    label_values = set(labels.values())
+def resolve_destination(labels):
+    """Chon (bot_token, chat_id, thread_id) cho mot alert."""
+    rule = find_rule(labels)
+    if rule is None:
+        app.logger.warning(f"No rule matched for labels: {labels}. Use DEFAULT bot")
+        return DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, DEFAULT_MESSAGE_THREAD_ID
 
-    for key in sorted(TELEGRAM_CONFIG.keys(), key=lambda x: -len(x.split('-'))):
-        parts = key.split('-')
-        if all(part in label_values for part in parts):
-            app.logger.info(f"Mapping found for multi-label key={key}")
-            return TELEGRAM_CONFIG[key]
+    app.logger.info(f"Rule matched: {rule.name}")
+    thread_id = rule.thread_id if rule.thread_id is not None else DEFAULT_MESSAGE_THREAD_ID
+    return rule.bot_token, rule.chat_id, thread_id
 
-    for label in PRIORITY_LABELS:
-        label_value = labels.get(label)
-        if label_value and label_value in TELEGRAM_CONFIG:
-            app.logger.info(f"Mapping found for {label}={label_value}")
-            return TELEGRAM_CONFIG[label_value]
 
-    app.logger.warning(f"No mapping found for labels: {labels}. Use DEFAULT BOT TOKEN")
-    return None
+@app.route('/health', methods=['GET'])
+def health():
+    """Cho HEALTHCHECK cua Docker / liveness probe. Khong can auth."""
+    alive = _worker_thread.is_alive()
+    body = {
+        'status': 'ok' if alive else 'degraded',
+        'worker_alive': alive,
+        'queue_size': alert_queue.qsize(),
+        'queue_maxsize': QUEUE_MAXSIZE,
+        'dedup_cache_size': len(recent_alerts_cache),
+        'rules_loaded': len(RULES),
+        'default_bot_configured': bool(DEFAULT_BOT_TOKEN and DEFAULT_CHAT_ID),
+    }
+    return jsonify(body), 200 if alive else 503
 
 
 @app.route('/alert', methods=['POST'])
 @auth.login_required
 def alertmanager_webhook():
-    data = request.json
+    data = request.get_json(silent=True)
 
-    if not data or 'alerts' not in data:
-        app.logger.error("Invalid request - no alerts found")
+    if not isinstance(data, dict):
+        app.logger.error("Invalid request - body khong phai JSON object")
+        return jsonify({'status': 'error', 'message': 'Invalid request'}), 400
+
+    alerts = data.get('alerts')
+    if not isinstance(alerts, list):
+        app.logger.error("Invalid request - 'alerts' thieu hoac khong phai mang")
         return jsonify({'status': 'error', 'message': 'Invalid request'}), 400
 
     app.logger.info("Webhook called")
-    app.logger.debug(f"Received data: {json.dumps(data)}")
+    if LOG_PAYLOAD:
+        app.logger.debug(f"Received data: {json.dumps(data, default=str)}")
 
-    # Enqueue alerts for background processing -- return 200 immediately.
-    # background_worker() drains the queue with rate limiting (SEND_DELAY between msgs).
-    # This prevents Gunicorn timeout and AlertManager retries on slow batches.
+    # Enqueue alerts cho background worker -> tra 200 ngay.
+    # background_worker() drain queue voi rate limit (SEND_DELAY giua cac msg),
+    # tranh gunicorn timeout va Alertmanager retry tren batch cham.
     queued = 0
-    for alert in data['alerts']:
+    duplicates = 0
+    dropped = 0
+
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            app.logger.warning(f"Bo qua phan tu 'alerts' khong phai object: {type(alert).__name__}")
+            dropped += 1
+            continue
+
         # reserve_alert() da log chi tiet khi trung -> khong log lap o day
         is_dup, alert_hash = reserve_alert(alert)
         if is_dup:
+            duplicates += 1
             continue
 
-        labels = alert.get('labels', {})
-        annotations = alert.get('annotations', {})
+        labels = alert.get('labels')
+        if not isinstance(labels, dict):
+            labels = {}
+        annotations = alert.get('annotations')
+        if not isinstance(annotations, dict):
+            annotations = {}
 
-        bot_token = DEFAULT_BOT_TOKEN
-        chat_id = DEFAULT_CHAT_ID
-        thread_id = DEFAULT_MESSAGE_THREAD_ID
+        bot_token, chat_id, thread_id = resolve_destination(labels)
 
-        mapping = find_mapping_from_labels(labels)
+        # Mot alert di dang khong duoc lam hong ca batch: ban cu de KeyError
+        # thoat ra 500, keo theo nhung alert da reserve nhung chua vao queue
+        # bi nuot mat trong ca chu ky dedup.
+        try:
+            message = format_telegram_message(alert, labels, annotations)
+        except Exception as e:
+            app.logger.error(f"Khong format duoc alert {labels}: {e}", exc_info=True)
+            release_alert(alert_hash)
+            dropped += 1
+            continue
 
-        if mapping:
-            bot_token = mapping['BOT_TOKEN']
-            chat_id = mapping['CHAT_ID']
-            thread_id = mapping.get('MESSAGE_THREAD_ID', thread_id)
+        try:
+            alert_queue.put_nowait(AlertJob(bot_token, chat_id, message, thread_id, alert_hash))
+        except queue.Full:
+            app.logger.error(
+                f"Queue day ({QUEUE_MAXSIZE}) - drop alert {labels.get('alertname')}. "
+                "Telegram co the dang khong gui duoc; Alertmanager se retry"
+            )
+            release_alert(alert_hash)
+            dropped += 1
+            continue
 
-        message = format_telegram_message(alert, labels, annotations)
-        alert_queue.put(AlertJob(bot_token, chat_id, message, thread_id, alert_hash))
         queued += 1
 
-    app.logger.info(f"Queued {queued} alert(s) for background sending")
+    app.logger.info(
+        f"Queued {queued} alert(s), {duplicates} duplicate(s), {dropped} dropped"
+    )
 
-    return jsonify({'status': 'ok'}), 200
+    return jsonify({
+        'status': 'ok',
+        'queued': queued,
+        'duplicates': duplicates,
+        'dropped': dropped,
+    }), 200
 
 
 if __name__ == '__main__':
