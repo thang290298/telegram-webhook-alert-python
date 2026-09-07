@@ -49,6 +49,13 @@ def _log(level, msg):
     print(f"[{level}] config: {msg}", file=sys.stderr, flush=True)
 
 
+class Target(NamedTuple):
+    """Mot dich den: bot nao, chat nao, topic nao."""
+    bot_token: str
+    chat_id: str
+    thread_id: Optional[str]
+
+
 class Rule(NamedTuple):
     """Mot rule routing da chuan hoa.
 
@@ -57,14 +64,16 @@ class Rule(NamedTuple):
               co value nay" (ngu nghia cua schema cu).
     alt_value: chi dung cho schema cu - cho phep key co dau '-' match nguyen
                khoi truoc khi bi tach thanh nhieu phan.
+    targets:   danh sach dich den. Mot rule co the ban vao nhieu group/topic.
+    cont:      True -> sau khi rule nay khop van xet tiep cac rule sau
+               (giong 'continue' cua Alertmanager route).
     """
     name: str
     matchers: Tuple[Tuple[Optional[str], str], ...]
     explicit: bool
-    bot_token: str
-    chat_id: str
-    thread_id: Optional[str]
+    targets: Tuple["Target", ...]
     alt_value: Optional[str] = None
+    cont: bool = False
 
 
 def _load_config(path):
@@ -123,20 +132,75 @@ def _norm_thread_id(value, rule_name):
     return text
 
 
+def _build_targets(name, spec):
+    """Danh sach dich den cua mot rule.
+
+    Ho tro 2 cach viet:
+      - 1 dich : BOT_TOKEN / CHAT_ID / MESSAGE_THREAD_ID ngay trong rule
+      - N dich : "targets": [ {BOT_TOKEN, CHAT_ID, MESSAGE_THREAD_ID}, ... ]
+    Viet ca hai thi gop lai. Dich trung nhau (cung chat + topic) duoc loai bo.
+    """
+    raw_targets = []
+
+    if spec.get('BOT_TOKEN') or spec.get('CHAT_ID'):
+        raw_targets.append(spec)
+
+    extra = spec.get('targets')
+    if extra is not None:
+        if not isinstance(extra, list):
+            _log('ERROR', f"rule '{name}': 'targets' phai la mang [...] - bo qua rule")
+            return None
+        raw_targets.extend(extra)
+
+    if not raw_targets:
+        _log('ERROR', f"rule '{name}' khong co dich den (thieu BOT_TOKEN/CHAT_ID hoac 'targets') "
+                      "- bo qua, alert khop rule nay se ve DEFAULT bot")
+        return None
+
+    targets = []
+    seen = set()
+    for idx, raw in enumerate(raw_targets):
+        label = f"rule '{name}' target #{idx + 1}"
+        if not isinstance(raw, dict):
+            _log('ERROR', f"{label} phai la object - bo qua target nay")
+            continue
+
+        bot_token = raw.get('BOT_TOKEN')
+        chat_id = raw.get('CHAT_ID')
+        if not bot_token or not chat_id:
+            _log('ERROR', f"{label} thieu BOT_TOKEN hoac CHAT_ID - bo qua target nay")
+            continue
+
+        target = Target(
+            bot_token=str(bot_token),
+            chat_id=str(chat_id),
+            thread_id=_norm_thread_id(raw.get('MESSAGE_THREAD_ID'), name),
+        )
+        key = (target.chat_id, target.thread_id)
+        if key in seen:
+            _log('WARNING', f"{label} trung dich voi target truoc do - bo qua de khong gui 2 lan")
+            continue
+        seen.add(key)
+        targets.append(target)
+
+    if not targets:
+        _log('ERROR', f"rule '{name}': khong target nao hop le - bo qua rule")
+        return None
+
+    return tuple(targets)
+
+
 def _build_rule(name, spec):
     """Chuyen mot entry trong config thanh Rule, hoac None neu khong hop le."""
     if not isinstance(spec, dict):
         _log('ERROR', f"rule '{name}' phai la object - bo qua")
         return None
 
-    bot_token = spec.get('BOT_TOKEN')
-    chat_id = spec.get('CHAT_ID')
-    if not bot_token or not chat_id:
-        _log('ERROR', f"rule '{name}' thieu BOT_TOKEN hoac CHAT_ID - bo qua, "
-                      "alert khop key nay se ve DEFAULT bot")
+    targets = _build_targets(name, spec)
+    if targets is None:
         return None
 
-    thread_id = _norm_thread_id(spec.get('MESSAGE_THREAD_ID'), name)
+    cont = bool(spec.get('continue', False))
     raw_match = spec.get('match')
 
     # --- schema moi: match theo dung label key ---
@@ -154,9 +218,8 @@ def _build_rule(name, spec):
             name=name,
             matchers=tuple(sorted(matchers)),
             explicit=True,
-            bot_token=str(bot_token),
-            chat_id=str(chat_id),
-            thread_id=thread_id,
+            targets=targets,
+            cont=cont,
         )
 
     # --- schema cu: ten key chinh la value cua label, noi bang '-' ---
@@ -169,10 +232,9 @@ def _build_rule(name, spec):
         name=name,
         matchers=tuple((None, p) for p in parts),
         explicit=False,
-        bot_token=str(bot_token),
-        chat_id=str(chat_id),
-        thread_id=thread_id,
+        targets=targets,
         alt_value=name if len(parts) > 1 else None,
+        cont=cont,
     )
 
 
@@ -187,7 +249,7 @@ def _build_rules(data):
             _log('ERROR', "'rules' phai la object - bo qua")
 
     for key, value in data.items():
-        if key in ('PRIORITY_LABELS', 'rules'):
+        if key in ('PRIORITY_LABELS', 'rules') or key.startswith('_'):
             continue
         if key in raw_rules:
             _log('WARNING', f"rule '{key}' co ca trong 'rules' lan o top-level - dung ban trong 'rules'")
@@ -196,13 +258,27 @@ def _build_rules(data):
 
     rules = []
     for name, spec in raw_rules.items():
+        # Key bat dau bang '_' la ghi chu cua nguoi viet config (JSON khong co
+        # cu phap comment) - bo qua im lang, khong coi la rule hong.
+        if name.startswith('_'):
+            continue
         rule = _build_rule(name, spec)
         if rule is not None:
             rules.append(rule)
 
-    # Nhieu dieu kien -> uu tien cao hon. Cung so dieu kien: schema moi thang
-    # schema cu. Cuoi cung sap theo ten de thu tu deterministic giua cac lan boot.
-    rules.sort(key=lambda r: (-len(r.matchers), 0 if r.explicit else 1, r.name))
+    # Thu tu xet rule:
+    #   1. Rule co "continue": true di TRUOC. Chung khong "an" alert ma chi
+    #      nhan ban them dich den roi cho xet tiep - neu de sau, mot rule
+    #      thuong khop truoc se dung vong lap va rule continue khong bao gio chay.
+    #   2. Nhieu dieu kien hon -> uu tien cao hon.
+    #   3. Cung so dieu kien: schema 'match' thang schema cu.
+    #   4. Cuoi cung sap theo ten, de thu tu deterministic giua cac lan boot.
+    rules.sort(key=lambda r: (
+        0 if r.cont else 1,
+        -len(r.matchers),
+        0 if r.explicit else 1,
+        r.name,
+    ))
     return rules
 
 
@@ -249,12 +325,15 @@ def _rule_matches(rule, labels, priority_values):
     return True
 
 
-def find_rule(labels):
-    """Tra ve Rule khop dau tien theo do uu tien, hoac None neu khong khop."""
-    if not RULES:
-        return None
-    if not isinstance(labels, dict):
-        return None
+def find_rules(labels):
+    """Tra ve danh sach Rule khop, theo do uu tien.
+
+    Mac dinh dung o rule khop dau tien (giong truoc day). Rule co
+    "continue": true thi sau khi khop van xet tiep cac rule phia sau, nen mot
+    alert co the ban vao nhieu group - giong 'continue' cua Alertmanager route.
+    """
+    if not RULES or not isinstance(labels, dict):
+        return []
 
     if PRIORITY_LABELS:
         priority_values = {str(labels[k]) for k in PRIORITY_LABELS if k in labels}
@@ -262,7 +341,17 @@ def find_rule(labels):
         # Khong khai bao PRIORITY_LABELS -> giu hanh vi cu (doi chieu moi label value)
         priority_values = {str(v) for v in labels.values()}
 
+    matched = []
     for rule in RULES:
-        if _rule_matches(rule, labels, priority_values):
-            return rule
-    return None
+        if not _rule_matches(rule, labels, priority_values):
+            continue
+        matched.append(rule)
+        if not rule.cont:
+            break
+    return matched
+
+
+def find_rule(labels):
+    """Rule khop dau tien, hoac None. Giu lai cho code/test cu."""
+    matched = find_rules(labels)
+    return matched[0] if matched else None

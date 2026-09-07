@@ -57,7 +57,7 @@ check("key ghep 'site-provider' khop 2 label", r and r.name == "site-provider", 
 r = cfg.find_rule({"site": "site-provider"})
 check("value chua dau '-' van khop nguyen khoi", r and r.name == "site-provider", r)
 
-check("thread_id duoc chuan hoa tu config", cfg.find_rule({"service": "service"}).thread_id == "7")
+check("thread_id duoc chuan hoa tu config", cfg.find_rule({"service": "service"}).targets[0].thread_id == "7")
 
 print("\n[2] Routing - schema MOI ('match' theo dung label key)")
 modern = {
@@ -97,7 +97,7 @@ loaded = {r.name for r in cfg.RULES}
 check("rule thieu CHAT_ID bi loai", "thieu_chat" not in loaded, loaded)
 check("rule khong phai object bi loai", "khong_phai_object" not in loaded, loaded)
 check("MESSAGE_THREAD_ID sai -> None chu khong crash",
-      cfg.find_rule({"env": "thread_sai"}).thread_id is None)
+      cfg.find_rule({"env": "thread_sai"}).targets[0].thread_id is None)
 
 # ============================================================
 print("\n[4] Format message MarkdownV2")

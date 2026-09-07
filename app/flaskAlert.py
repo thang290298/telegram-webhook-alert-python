@@ -35,7 +35,7 @@ from config import (
     DEFAULT_CHAT_ID,
     DEFAULT_MESSAGE_THREAD_ID,
     RULES,
-    find_rule,
+    find_rules,
 )
 
 # ================== LOGGING ==================
@@ -235,10 +235,15 @@ def _alert_identity(alert):
     return "lb:" + json.dumps(labels, sort_keys=True, default=str)
 
 
-def build_alert_hash(alert):
+def build_alert_hash(alert, dest_key=None):
     """Tra ve (alert_hash, key_fields).
     Key gom: identity (full labels) + status + timestamp cua vong doi tuong ung
-    -> chan repeat cua Alertmanager, nhung van cho flapping va resolved di qua."""
+    -> chan repeat cua Alertmanager, nhung van cho flapping va resolved di qua.
+
+    dest_key = (chat_id, thread_id): dedup tinh RIENG cho tung dich den. Mot
+    alert fan-out ra 3 group co 3 dau dedup doc lap, nen khi 1 group gui loi
+    va Alertmanager retry, chi group do duoc gui lai - 2 group kia khong bi trung.
+    """
     status = str(alert.get('status', '')).lower()
     raw_ts = alert.get('startsAt') if status == 'firing' else alert.get('endsAt')
 
@@ -252,9 +257,10 @@ def build_alert_hash(alert):
     key_fields = {
         'identity': _alert_identity(alert),
         'status': status,
-        'timestamp': ts
+        'timestamp': ts,
+        'dest': list(dest_key) if dest_key else None,
     }
-    alert_hash = md5(json.dumps(key_fields, sort_keys=True).encode()).hexdigest()
+    alert_hash = md5(json.dumps(key_fields, sort_keys=True, default=str).encode()).hexdigest()
     return alert_hash, key_fields
 
 
@@ -272,16 +278,17 @@ def _warn_capacity(current):
     )
 
 
-def reserve_alert(alert):
+def reserve_alert(alert, dest_key=None):
     """Tra ve (is_duplicate, alert_hash).
     Danh dau alert ngay khi nhan de chan trung trong cung 1 burst;
     neu gui that bai, background_worker goi release_alert() de tha ra."""
-    alert_hash, key_fields = build_alert_hash(alert)
+    alert_hash, key_fields = build_alert_hash(alert, dest_key)
 
     with cache_lock:
         if alert_hash in recent_alerts_cache:
             app.logger.info(
                 f"Duplicate alert ({key_fields['status']}) skipped: {key_fields['identity']}"
+                + (f" -> chat {dest_key[0]}" if dest_key else "")
             )
             return True, alert_hash
 
@@ -479,16 +486,34 @@ async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_r
     return SEND_RETRY
 
 
-def resolve_destination(labels):
-    """Chon (bot_token, chat_id, thread_id) cho mot alert."""
-    rule = find_rule(labels)
-    if rule is None:
-        app.logger.warning(f"No rule matched for labels: {labels}. Use DEFAULT bot")
-        return DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, DEFAULT_MESSAGE_THREAD_ID
+def resolve_destinations(labels):
+    """Danh sach (bot_token, chat_id, thread_id) ma alert nay phai duoc gui den.
 
-    app.logger.info(f"Rule matched: {rule.name}")
-    thread_id = rule.thread_id if rule.thread_id is not None else DEFAULT_MESSAGE_THREAD_ID
-    return rule.bot_token, rule.chat_id, thread_id
+    Mot alert co the ra nhieu group: rule khai bao nhieu 'targets', va/hoac
+    nhieu rule cung khop nho "continue": true. Dich trung nhau (cung chat +
+    topic) chi giu mot lan de khong gui doi.
+    """
+    rules = find_rules(labels)
+    if not rules:
+        app.logger.warning(f"No rule matched for labels: {labels}. Use DEFAULT bot")
+        return [(DEFAULT_BOT_TOKEN, DEFAULT_CHAT_ID, DEFAULT_MESSAGE_THREAD_ID)]
+
+    destinations = []
+    seen = set()
+    for rule in rules:
+        for target in rule.targets:
+            thread_id = target.thread_id if target.thread_id is not None else DEFAULT_MESSAGE_THREAD_ID
+            key = (target.chat_id, thread_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            destinations.append((target.bot_token, target.chat_id, thread_id))
+
+    app.logger.info(
+        f"Rule matched: {', '.join(r.name for r in rules)}"
+        f" -> {len(destinations)} dich den"
+    )
+    return destinations
 
 
 @app.route('/health', methods=['GET'])
@@ -538,12 +563,6 @@ def alertmanager_webhook():
             dropped += 1
             continue
 
-        # reserve_alert() da log chi tiet khi trung -> khong log lap o day
-        is_dup, alert_hash = reserve_alert(alert)
-        if is_dup:
-            duplicates += 1
-            continue
-
         labels = alert.get('labels')
         if not isinstance(labels, dict):
             labels = {}
@@ -551,31 +570,42 @@ def alertmanager_webhook():
         if not isinstance(annotations, dict):
             annotations = {}
 
-        bot_token, chat_id, thread_id = resolve_destination(labels)
-
-        # Mot alert di dang khong duoc lam hong ca batch: ban cu de KeyError
-        # thoat ra 500, keo theo nhung alert da reserve nhung chua vao queue
-        # bi nuot mat trong ca chu ky dedup.
+        # Mot alert di dang / mot rule cau hinh sai khong duoc lam hong ca batch.
+        # Ban cu de exception thoat ra 500 (vd TypeError khi entry trong
+        # telegram_config.json la mang [...] thay vi object {...}), keo theo
+        # nhung alert da reserve nhung chua vao queue bi nuot mat ca chu ky dedup.
         try:
+            destinations = resolve_destinations(labels)
             message = format_telegram_message(alert, labels, annotations)
         except Exception as e:
-            app.logger.error(f"Khong format duoc alert {labels}: {e}", exc_info=True)
-            release_alert(alert_hash)
+            app.logger.error(f"Khong xu ly duoc alert {labels}: {e}", exc_info=True)
             dropped += 1
             continue
 
-        try:
-            alert_queue.put_nowait(AlertJob(bot_token, chat_id, message, thread_id, alert_hash))
-        except queue.Full:
-            app.logger.error(
-                f"Queue day ({QUEUE_MAXSIZE}) - drop alert {labels.get('alertname')}. "
-                "Telegram co the dang khong gui duoc; Alertmanager se retry"
-            )
-            release_alert(alert_hash)
-            dropped += 1
-            continue
+        # Dedup tinh rieng cho tung dich: mot group gui loi khong keo theo
+        # viec gui lai o nhung group da nhan duoc.
+        for bot_token, chat_id, thread_id in destinations:
+            # reserve_alert() da log chi tiet khi trung -> khong log lap o day
+            is_dup, alert_hash = reserve_alert(alert, (chat_id, thread_id))
+            if is_dup:
+                duplicates += 1
+                continue
 
-        queued += 1
+            try:
+                alert_queue.put_nowait(
+                    AlertJob(bot_token, chat_id, message, thread_id, alert_hash)
+                )
+            except queue.Full:
+                app.logger.error(
+                    f"Queue day ({QUEUE_MAXSIZE}) - drop alert {labels.get('alertname')} "
+                    f"-> chat {chat_id}. Telegram co the dang khong gui duoc; "
+                    "Alertmanager se retry"
+                )
+                release_alert(alert_hash)
+                dropped += 1
+                continue
+
+            queued += 1
 
     app.logger.info(
         f"Queued {queued} alert(s), {duplicates} duplicate(s), {dropped} dropped"

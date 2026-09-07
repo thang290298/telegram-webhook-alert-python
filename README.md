@@ -72,6 +72,7 @@ Mount vào container tại `/prometheus-telegram-alert/telegram_config.json`.
 Xem `telegram_config.example.json` làm mẫu.
 
 > Đổi file này phải **restart container** — config chỉ được đọc một lần lúc boot.
+> Key bắt đầu bằng `_` được bỏ qua hoàn toàn → dùng làm ghi chú (JSON không có cú pháp comment).
 
 ### Dạng khuyến nghị: `match` theo đúng label key
 
@@ -102,6 +103,58 @@ Xem `telegram_config.example.json` làm mẫu.
 - Không rule nào khớp → dùng `DEFAULT_BOT_TOKEN` / `DEFAULT_CHAT_ID`
 - `MESSAGE_THREAD_ID` tùy chọn; bỏ qua → fallback `DEFAULT_MESSAGE_THREAD_ID`
 
+### Gửi một alert đến nhiều group
+
+Hai cách, dùng riêng hoặc kết hợp.
+
+**Cách 1 — `targets`: một rule, nhiều đích**
+
+```json
+"ceph-rgw": {
+  "match": { "service": "ceph", "role": "rgw" },
+  "targets": [
+    { "BOT_TOKEN": "111:AAA", "CHAT_ID": "-100111", "MESSAGE_THREAD_ID": "5" },
+    { "BOT_TOKEN": "888:HHH", "CHAT_ID": "-100888" }
+  ]
+}
+```
+
+**Cách 2 — `continue`: nhiều rule cùng khớp** (giống `continue` của Alertmanager route)
+
+```json
+"noc-critical": {
+  "match": { "severity": "critical" },
+  "continue": true,
+  "BOT_TOKEN": "999:III", "CHAT_ID": "-100999", "MESSAGE_THREAD_ID": "1"
+},
+"ceph-hpg": {
+  "match": { "site": "hpg", "service": "ceph" },
+  "BOT_TOKEN": "222:BBB", "CHAT_ID": "-100222"
+}
+```
+
+Alert `severity=critical, site=hpg, service=ceph` → vào **cả** group NOC lẫn group Ceph.
+
+- Rule `continue` **luôn được xét trước** mọi rule thường, bất kể số điều kiện — nếu không, một rule thường khớp trước sẽ dừng vòng lặp và rule `continue` không bao giờ chạy
+- Vòng lặp dừng ở rule thường (không `continue`) đầu tiên khớp
+- Đích trùng nhau (cùng `CHAT_ID` + `MESSAGE_THREAD_ID`) chỉ giữ một lần, không gửi đôi
+- Target hỏng (thiếu `BOT_TOKEN`/`CHAT_ID`) bị loại lúc boot, các target còn lại vẫn chạy
+
+**Dedup tính riêng cho từng đích.** Một alert fan-out ra 3 group có 3 dấu dedup độc lập: nếu group 3 gửi lỗi mạng, Alertmanager retry chỉ gửi lại group 3 — group 1 và 2 không bị trùng.
+
+Kiểm tra trước khi deploy:
+
+```bash
+python tools/check_config.py telegram_config.json severity=critical site=hpg service=ceph
+```
+
+```
+-> Khop rule: noc-critical, ceph-hpg
+   [1] rule 'noc-critical'  CHAT_ID=-1009999999999  THREAD=1
+   [2] rule 'ceph-hpg'      CHAT_ID=-1002222222222  THREAD=5
+   => alert nay se duoc gui den 2 noi
+```
+
 ### Dạng cũ (vẫn chạy được)
 
 ```json
@@ -121,9 +174,10 @@ Hạn chế của dạng cũ: không phân biệt được label nào mang value
 
 ### Thứ tự ưu tiên
 
-1. Rule nhiều điều kiện hơn
-2. Cùng số điều kiện → rule `match` thắng rule dạng cũ
-3. Cùng cả hai → sắp theo tên rule (deterministic giữa các lần boot)
+1. Rule có `"continue": true` — xét trước tất cả
+2. Rule nhiều điều kiện hơn
+3. Cùng số điều kiện → rule `match` thắng rule dạng cũ
+4. Cùng cả ba → sắp theo tên rule (deterministic giữa các lần boot)
 
 Rule thiếu `BOT_TOKEN`/`CHAT_ID`, hoặc `MESSAGE_THREAD_ID` không phải số, sẽ bị loại/chuẩn hoá ngay lúc boot và ghi log — không để nổ lúc đang xử lý webhook.
 
@@ -232,7 +286,17 @@ curl -s http://127.0.0.1:9119/health | jq
 
 ```bash
 pip install -r requirements.txt
-python tests/test_all.py
+python tests/test_all.py      # 42 test
+python tests/test_fanout.py   # 14 test fan-out
 ```
+
+Kiểm tra config mà không cần cài gì (chỉ dùng thư viện chuẩn):
+
+```bash
+python tools/check_config.py telegram_config.json
+python tools/check_config.py telegram_config.json site=dbp3 service=openstack
+```
+
+Exit code `1` khi có entry bị loại → cắm được vào CI hoặc chạy trước `docker restart`.
 
 Bộ test dùng Telegram giả lập, không cần token thật: kiểm tra routing (cả hai schema), format MarkdownV2, dedup reserve/release, phân loại lỗi tạm thời vs vĩnh viễn, auth, `/health`, và input dị dạng.

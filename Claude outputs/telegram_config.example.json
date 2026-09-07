@@ -6,43 +6,12 @@
     "Rule nhieu dieu kien hon duoc uu tien truoc.",
     "Khong rule nao khop -> DEFAULT_BOT_TOKEN / DEFAULT_CHAT_ID.",
     "MESSAGE_THREAD_ID tuy chon; bo qua -> DEFAULT_MESSAGE_THREAD_ID.",
-    "Gui 1 alert den NHIEU group: dung 'targets': [...] hoac 'continue': true.",
     "Doi file nay phai restart container."
   ],
 
-  "PRIORITY_LABELS": ["site", "service", "role", "severity", "product"],
+  "PRIORITY_LABELS": ["site", "service", "role", "product"],
 
   "rules": {
-    "_0": [
-      "=== Rule 'continue': khong an alert, chi nhan ban them dich roi xet tiep.",
-      "    Luon duoc xet TRUOC moi rule thuong. ==="
-    ],
-
-    "noc-critical": {
-      "match": { "severity": "critical" },
-      "continue": true,
-      "BOT_TOKEN": "8100000009:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "CHAT_ID": "-1009999999999",
-      "MESSAGE_THREAD_ID": "1"
-    },
-
-    "_01": "=== Rule co nhieu dich: 1 alert vao ca group team lan group truc ===",
-
-    "ceph-multi": {
-      "match": { "service": "ceph", "role": "rgw" },
-      "targets": [
-        {
-          "BOT_TOKEN": "8100000002:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-          "CHAT_ID": "-1002222222222",
-          "MESSAGE_THREAD_ID": "5"
-        },
-        {
-          "BOT_TOKEN": "8100000008:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-          "CHAT_ID": "-1008888888888"
-        }
-      ]
-    },
-
     "_1": "=== 2 dieu kien: cu the nhat, duoc xet truoc ===",
 
     "openstack-dbp3": {
