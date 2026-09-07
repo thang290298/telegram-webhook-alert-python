@@ -24,13 +24,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /prometheus-telegram-alert
 
+# curl        : dung cho HEALTHCHECK ben duoi
+# vim/telnet/nc: cong cu debug trong container (xem config da mount,
+#                test ket noi toi api.telegram.org / Alertmanager)
+# unzip        : giai nen file mang vao container khi can
+# 'telnet' o Debian moi la goi chuyen tiep va co the khong con
+#   -> fallback sang inetutils-telnet de build khong gay
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         curl \
         vim \
-        bash \
         unzip \
-        curl \
         netcat-openbsd \
  && (apt-get install -y --no-install-recommends telnet \
      || apt-get install -y --no-install-recommends inetutils-telnet) \

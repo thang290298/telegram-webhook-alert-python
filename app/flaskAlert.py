@@ -330,21 +330,30 @@ def safe_code(text):
     return str(text).replace('\\', '\\\\').replace('`', '\\`')
 
 
-def _render_value(text):
-    """Tra ve (kieu, chuoi da escape) cho mot gia tri annotation.
+def _render_annotation(title, value):
+    """Dinh dang mot annotation thanh (cac) dong cua message.
 
-    - Mot dong  -> 'inline': boc trong `code` cho de doc.
-    - Nhieu dong-> 'block' : text thuong da escape, giu nguyen xuong dong.
+    1 dong:      *Title:* `value`
+    Nhieu dong:  *Title:*
+                 `dong 1`
+                 `dong 2`
 
-    KHONG dung pre-block ``` cho chuoi nhieu dong: Telegram render no thanh
-    mot khung lon kem nut 'copy', doc alert rat roi. Cung khong dung inline
-    code vi MarkdownV2 cam xuong dong trong inline code -> Telegram tra ve
-    400 'can't parse entities' va alert khong bao gio den noi.
+    Moi dong duoc boc inline code RIENG. Ly do:
+      - Boc ca khoi bang mot cap backtick khong duoc: MarkdownV2 cam xuong dong
+        trong inline code -> Telegram tra 400 'can't parse entities'.
+      - Dung pre-block ``` cung khong duoc: Telegram ve mot khung lon kem nut
+        'copy', doc alert rat roi.
+    Boc tung dong cho ra dung mau code nhu Summary ma khong co khung copy.
     """
-    text = str(text)
-    if '\n' in text:
-        return 'block', escape_md2(text.strip('\n'))
-    return 'inline', safe_code(text)
+    text = str(value).strip('\n')
+    if '\n' not in text:
+        return f"*{title}:* `{safe_code(text)}`"
+
+    lines = [
+        f"`{safe_code(line)}`" if line.strip() else ''
+        for line in text.split('\n')
+    ]
+    return f"*{title}:*\n" + '\n'.join(lines)
 
 
 def format_telegram_message(alert, labels, annotations):
@@ -380,11 +389,7 @@ def format_telegram_message(alert, labels, annotations):
         value = annotations.get(field)
         if value in (None, ''):
             continue
-        kind, rendered = _render_value(value)
-        if kind == 'block':
-            message_lines.append(f"*{title}:*\n{rendered}")
-        else:
-            message_lines.append(f"*{title}:* `{rendered}`")
+        message_lines.append(_render_annotation(title, value))
 
     raw_ts = alert.get('endsAt') if status == 'resolved' else alert.get('startsAt')
     label = 'Resolved' if status == 'resolved' else 'Started'
