@@ -10,7 +10,8 @@ Webhook receiver nhận alert từ Prometheus Alertmanager và gửi thông báo
 - **Rate limiting**: queue background có giới hạn, throttle theo từng chat, tự retry khi bị Telegram flood control
 - **Thread/Topic support**: hỗ trợ `message_thread_id` cho Telegram group có topics
 - Basic Auth (so sánh hằng thời gian) bảo vệ webhook endpoint
-- MarkdownV2 format với icon theo severity (critical 🚨 / warning ⚠️ / resolved ✅)
+- MarkdownV2 format với bảng cấp độ 4 mức theo mục 5.3 ATP: critical ⛔ / major ❗ / minor ⚠️ / warning 🔹 / info ℹ️, resolved ✅, status lạ ❔. Icon chọn theo ngữ nghĩa chứ không theo màu, đọc được cả khi in đen trắng
+- Tin RESOLVED có cả `Bắt đầu` lẫn `Kết thúc`, và gắn hậu tố *(lúc cảnh báo)* vào Summary/Description vì nội dung hai trường đó là ảnh chụp lúc alert firing
 - Endpoint `/health` cho Docker HEALTHCHECK / liveness probe
 
 ---

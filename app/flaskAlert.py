@@ -356,54 +356,165 @@ def _render_annotation(title, value):
     return f"*{title}:*\n" + '\n'.join(lines)
 
 
+# ================== DINH DANG TIN NHAN ==================
+# Bang cap do theo muc 5.3 cua quy dinh giam sat. Ban cu chi biet critical va
+# warning nen major va minor roi het vao nhanh else -> hien thi icon "info",
+# sai han muc do nghiem trong.
+# Icon chon theo NGU NGHIA chu khong theo mau: doc duoc ca tren man hinh den
+# trang va voi nguoi mu mau do/cam - mau khong phai kenh thong tin duy nhat.
+SEVERITY_META = {
+    'critical': ('⛔', 'NGHIÊM TRỌNG'),
+    'major':    ('❗', 'CẢNH BÁO LỚN'),
+    'minor':    ('⚠️', 'CẢNH BÁO NHỎ'),
+    'warning':  ('🔹', 'NHẮC NHỞ'),
+    'info':     ('ℹ️', 'GHI NHẬN'),
+}
+
+# Severity khong co trong SEVERITY_META (vd 'page', 'none', hoac rong). KHONG
+# duoc lay icon cua muc 'info' lam mac dinh, khong thi mot alert dang firing voi
+# severity la se nhin y het mot ghi nhan vo thuong vo phat. Firing -> coi nhu
+# nghiem trong; resolved -> danh dau '?' vi cap do khong xac dinh.
+SEVERITY_ICON_UNKNOWN_FIRING = '⛔'
+SEVERITY_ICON_UNKNOWN_RESOLVED = '❔'
+
+# Status khong phai firing / resolved (rong, 'suppressed', sai chinh ta...).
+# Khong duoc gop vao nhanh firing: bao "DANG CANH BAO" cho mot payload di dang
+# la noi doi voi nguoi truc. In nguyen trang thai de biet payload bat thuong.
+STATUS_ICON_UNKNOWN = '❔'
+
+# endsAt cua alert dang firing la zero time cua Go. Moi phep tinh thoi luong
+# deu phai chan gia tri nay, khong thi ra so am khong lo.
+_ZERO_TS_PREFIX = '0001-01-01'
+
+# Hau to gan vao tieu de Summary/Description trong tin RESOLVED. Noi dung hai
+# truong do la anh chup luc canh bao, khong phai trang thai hien tai.
+# Dat '' de bo hoan toan.
+ANNOTATION_SUFFIX_RESOLVED = ' (lúc cảnh báo)'
+
+
+def _host_of(labels):
+    """Ten may chu de hien thi: hostname -> host -> instance."""
+    for key in ('hostname', 'host', 'instance'):
+        value = labels.get(key)
+        if value:
+            return str(value)
+    return ''
+
+
+def _parse_ts(raw):
+    """Parse timestamp cua Alertmanager, tra ve None neu rong / zero / hong."""
+    if not raw or str(raw).startswith(_ZERO_TS_PREFIX):
+        return None
+    try:
+        return parser.parse(raw)
+    except Exception as e:
+        app.logger.warning(f"Failed to parse timestamp '{raw}': {e}")
+        return None
+
+
+def _fmt_ts(dt):
+    return dt.astimezone(pytz.timezone('Asia/Bangkok')).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _ts_line(title, dt, raw):
+    """Mot dong thoi gian, hoac None neu khong co gi de in.
+
+    Parse duoc -> in gio Viet Nam. Parse KHONG duoc nhung payload van co gia
+    tri tho -> in nguyen ban: mat dinh dang con hon mat han moc thoi gian,
+    va nguoi truc nhin ra ngay la Alertmanager gui timestamp la.
+    `title` khong duoc chua ky tu dac biet cua MarkdownV2.
+    """
+    if dt is not None:
+        return f"*{title}:* `{_fmt_ts(dt)}`"
+    if raw and not str(raw).startswith(_ZERO_TS_PREFIX):
+        return f"*{title}:* `{safe_code(raw)}`"
+    return None
+
+
 def format_telegram_message(alert, labels, annotations):
+    """Dung noi dung tin nhan Telegram.
+
+    Tin FIRING : Status, Alertname, Cap do, May chu/Site, Summary,
+                 Description, Bat dau.
+    Tin RESOLVED: nhu tren nhung tieu de Summary/Description co them
+                 "(luc canh bao)", va dong thoi gian la Ket thuc.
+    Status khac : in nguyen trang thai kem icon '?', khong gia vo la firing.
+
+    Summary/Description trong payload resolved la anh chup luc alert dang
+    firing chu khong phai trang thai hien tai - do la ly do co hau to.
+    """
     status = str(alert.get('status', '')).lower()
     severity = str(labels.get('severity', '')).lower()
-    status_text = str(alert.get('status', 'UNKNOWN')).upper()
+    is_resolved = status == 'resolved'
+    is_firing = status == 'firing'
 
-    if status == "resolved":
-        status_icon = "✅"
-        alertname_icon = "✅"
-        alertname_suffix = ""
-    elif severity == "critical":
-        status_icon = "\U0001f6a8"
-        alertname_icon = "\U0001f6a8"
-        alertname_suffix = "\U0001f6a8\U0001f6a8\U0001f6a8"
-    elif severity == "warning":
-        status_icon = "⚠️"
-        alertname_icon = "⚠️"
-        alertname_suffix = ""
+    sev_icon, sev_name = SEVERITY_META.get(severity, ('', ''))
+    if not sev_icon:
+        sev_icon = (SEVERITY_ICON_UNKNOWN_RESOLVED if is_resolved
+                    else SEVERITY_ICON_UNKNOWN_FIRING)
+
+    if is_resolved:
+        status_icon = '✅'
+        status_text = 'ĐÃ KHÔI PHỤC'
+    elif is_firing:
+        status_icon = sev_icon
+        status_text = 'ĐANG CẢNH BÁO'
     else:
-        status_icon = "ℹ️"
-        alertname_icon = "ℹ️"
-        alertname_suffix = ""
+        status_icon = STATUS_ICON_UNKNOWN
+        status_text = str(alert.get('status', '')).upper() or 'UNKNOWN'
 
-    alertname = escape_md2(labels.get('alertname', 'N/A'))
-
-    message_lines = [
+    lines = [
         f"*Status:* {status_icon} {escape_md2(status_text)} {status_icon}",
-        f"*Alertname:* {alertname_icon} {alertname}{alertname_suffix}"
+        f"*Alertname:* `{safe_code(labels.get('alertname', 'N/A'))}`",
     ]
 
-    for field, title in (('info', 'Info'), ('summary', 'Summary'), ('description', 'Description')):
+    # Cap do: luon hien thi, ke ca khi da khoi phuc - nguoi doc can biet
+    # su co vua roi nghiem trong den muc nao.
+    if severity:
+        label = f"{sev_name} ({severity})" if sev_name else severity
+        lines.append(f"*Cấp độ:* {sev_icon} {escape_md2(label)}")
+
+    # May chu / site tach thanh truong rieng thay vi de lan trong cau van,
+    # de loc va tim nhanh.
+    host = _host_of(labels)
+    site = labels.get('site')
+    if host or site:
+        parts = []
+        if host:
+            parts.append(f"*Máy chủ:* `{safe_code(host)}`")
+        if site:
+            parts.append(f"*Site:* `{safe_code(site)}`")
+        lines.append(' · '.join(parts))
+
+    # Tieu de PHAI escape truoc khi dua vao _render_annotation: ham do noi
+    # thang vao "*{title}:*", ma hau to "(luc canh bao)" co dau ngoac - ky tu
+    # dac biet cua MarkdownV2. Khong escape thi Telegram tra 400
+    # "can't parse entities", va send_telegram_alert coi 400 la loi vinh vien
+    # nen alert bi drop han, khong retry.
+    suffix = ANNOTATION_SUFFIX_RESOLVED if is_resolved else ''
+    for field, title in (('info', 'Info'), ('summary', 'Summary'),
+                         ('description', 'Description')):
         value = annotations.get(field)
         if value in (None, ''):
             continue
-        message_lines.append(_render_annotation(title, value))
+        lines.append(_render_annotation(escape_md2(title + suffix), value))
 
-    raw_ts = alert.get('endsAt') if status == 'resolved' else alert.get('startsAt')
-    label = 'Resolved' if status == 'resolved' else 'Started'
-    if raw_ts and status in ('firing', 'resolved'):
-        try:
-            correct_date = parser.parse(raw_ts).astimezone(
-                pytz.timezone('Asia/Bangkok')
-            ).strftime('%Y-%m-%d %H:%M:%S')
-            message_lines.append(f"*{label}:* `{correct_date}`")
-        except Exception as e:
-            app.logger.warning(f"Failed to format timestamp '{raw_ts}': {e}")
-            message_lines.append(f"*{label}:* `{safe_code(raw_ts)}`")
+    raw_start = alert.get('startsAt')
+    raw_end = alert.get('endsAt')
+    started = _parse_ts(raw_start)
+    ended = _parse_ts(raw_end)
 
-    return '\n'.join(message_lines)
+    if is_resolved:
+        # Tin resolved chi can moc ket thuc.
+        line = _ts_line('Kết thúc', ended, raw_end)
+        if line:
+            lines.append(line)
+    else:
+        line = _ts_line('Bắt đầu', started, raw_start)
+        if line:
+            lines.append(line)
+
+    return '\n'.join(lines)
 
 
 async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_retries=3):

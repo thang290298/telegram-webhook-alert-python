@@ -112,17 +112,80 @@ msg = fa.format_telegram_message(
 check("description nhieu dong: moi dong mot inline code, KHONG pre-block ```",
       "```" not in msg and "`line1`\n`line2`\n`line3`" in msg, msg)
 check("summary mot dong van dung inline code", "*Summary:* `one line`" in msg, msg)
-check("alertname duoc escape", "Disk\\-Full" in msg, msg)
+check("alertname boc inline code (khong con escape_md2)",
+      "*Alertname:* `Disk-Full`" in msg, msg)
 check("timestamp doi ve gio VN", "2026-09-07 17:00:00" in msg, msg)
-
-msg = fa.format_telegram_message({}, {}, {})
-check("alert thieu 'status' khong con KeyError (bug #5)", "UNKNOWN" in msg, msg)
+check("firing hien thi cap do theo severity",
+      "*C\u1ea5p \u0111\u1ed9:* \u26d4 NGHI\u00caM TR\u1eccNG \\(critical\\)" in msg, msg)
 
 msg = fa.format_telegram_message(
     {"status": "resolved", "endsAt": "2026-09-07T10:00:00Z"}, {},
     {"description": "co `backtick` va \\ backslash"})
 check("backtick duoc escape dung thay vi thay bang nhay don",
       "\\`backtick\\`" in msg and "\\\\ backslash" in msg, msg)
+
+print("\n[4b] Status khong phai firing/resolved (muc 2)")
+msg = fa.format_telegram_message({}, {}, {})
+check("alert thieu 'status' khong con KeyError (bug #5)", "UNKNOWN" in msg, msg)
+check("status rong KHONG bi bao nham la dang canh bao",
+      "\u0110ANG C\u1ea2NH B\u00c1O" not in msg, msg)
+
+msg = fa.format_telegram_message(
+    {"status": "suppressed", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "S"}, {})
+check("status la -> in nguyen trang thai, khong gia vo la firing",
+      "SUPPRESSED" in msg and "\u0110ANG C\u1ea2NH B\u00c1O" not in msg, msg)
+
+print("\n[4c] Fallback icon khi severity ngoai bang (muc 5)")
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "X", "severity": "page-now"}, {})
+check("severity la + firing -> KHONG dung icon cua muc info",
+      "\u2139\ufe0f" not in msg and "\u26d4" in msg, msg)
+
+for sev, icon in (("critical", "\u26d4"), ("major", "\u2757"),
+                  ("minor", "\u26a0\ufe0f"), ("warning", "\U0001f539"),
+                  ("info", "\u2139\ufe0f")):
+    m = fa.format_telegram_message(
+        {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+        {"alertname": "A", "severity": sev}, {})
+    check(f"severity {sev} -> dung icon rieng", icon in m, m)
+
+print("\n[4d] Fallback timestamp tho (muc 4)")
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "khong-phai-timestamp"}, {"alertname": "T"}, {})
+check("timestamp hong van in nguyen ban chu khong mat han dong thoi gian",
+      "*B\u1eaft \u0111\u1ea7u:* `khong-phai-timestamp`" in msg, msg)
+
+msg = fa.format_telegram_message(
+    {"status": "resolved", "endsAt": "cung-hong"}, {"alertname": "T2"}, {})
+check("resolved: endsAt hong van in nguyen ban",
+      "*K\u1ebft th\u00fac:* `cung-hong`" in msg, msg)
+
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z",
+     "endsAt": "0001-01-01T00:00:00Z"}, {"alertname": "Z0"}, {})
+check("endsAt zero-time cua Go khong sinh dong thoi gian rac", "0001" not in msg, msg)
+
+print("\n[4e] Tin RESOLVED")
+msg = fa.format_telegram_message(
+    {"status": "resolved", "startsAt": "2026-09-07T10:00:00Z",
+     "endsAt": "2026-09-10T14:13:20Z"},
+    {"alertname": "R", "severity": "major", "hostname": "rgw-02", "site": "hya"},
+    {"summary": "s"})
+check("resolved co dong Ket thuc",
+      "*K\u1ebft th\u00fac:* `2026-09-10 21:13:20`" in msg, msg)
+check("da bo han dong Keo dai", "K\u00e9o d\u00e0i" not in msg, msg)
+check("resolved danh dau annotation la anh chup luc canh bao",
+      "*Summary \\(l\u00fac c\u1ea3nh b\u00e1o\\):*" in msg, msg)
+check("resolved VAN in dong Bat dau (vi da bo Keo dai)",
+      "*B\u1eaft \u0111\u1ea7u:* `2026-09-07 17:00:00`" in msg, msg)
+check("resolved co du ca Bat dau lan Ket thuc, dung thu tu",
+      msg.index("B\u1eaft \u0111\u1ea7u") < msg.index("K\u1ebft th\u00fac"), msg)
+check("may chu / site tach thanh truong rieng",
+      "*M\u00e1y ch\u1ee7:* `rgw-02`" in msg and "*Site:* `hya`" in msg, msg)
+check("ham _fmt_duration da duoc go bo khoi module",
+      not hasattr(fa, "_fmt_duration"))
 
 # ============================================================
 print("\n[5] Dedup reserve/release")
