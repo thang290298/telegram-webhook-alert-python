@@ -57,11 +57,16 @@ receivers:
 | `ALERT_REPEAT_INTERVAL` | | `1800` | TTL dedup (giây) |
 | `ALERT_CACHE_MAXSIZE` | | `20000` | Số entry tối đa của cache dedup |
 | `SEND_DELAY` | | `3` | Giây giữa 2 message vào cùng một chat |
-| `QUEUE_MAXSIZE` | | `5000` | Giới hạn queue. Đầy → drop + log, Alertmanager retry |
+| `QUEUE_MAXSIZE` | | `5000` | Giới hạn queue. Đầy → trả **503** để Alertmanager retry |
 | `MAX_BATCH` | | `200` | Số job xử lý tối đa trong một batch |
 | `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `LOG_PAYLOAD` | | `false` | `true` = log nguyên payload webhook (to, có thể lộ dữ liệu) |
+| `LOG_PAYLOAD` | | `false` | `true` = log nguyên payload webhook ở mức INFO (to, có thể lộ dữ liệu) |
 | `ACCESS_LOG` | | tắt | `true` = bật access log của gunicorn |
+| `MAX_MESSAGE_CHARS` | | `3800` | Ngân sách ký tự của một message (trần cứng Telegram là 4096) |
+| `MAX_FIELD_CHARS` | | `256` | Chặn độ dài một trường ngắn: alertname, hostname, site, severity |
+| `MAX_CONTENT_LENGTH_BYTES` | | `2097152` | Kích thước body webhook tối đa. Vượt → 413 |
+| `SHUTDOWN_DRAIN_TIMEOUT` | | `20` | Giây chờ gửi nốt queue khi tắt. Phải < `graceful_timeout` (30) |
+| `DISPLAY_TZ` | | `Asia/Ho_Chi_Minh` | Múi giờ hiển thị trong message |
 | `GUNICORN_THREADS` | | `8` | Số thread |
 | `GUNICORN_TIMEOUT` | | `120` | Timeout worker (giây) |
 
@@ -277,7 +282,16 @@ curl -s http://127.0.0.1:9119/health | jq
 | Hết retry | **Thả dấu dedup** → Alertmanager retry đi qua được |
 | `BadRequest` / `Forbidden` / `InvalidToken` / `ChatMigrated` | **Giữ dấu dedup**, log ERROR, không retry (retry cũng fail y hệt) |
 
-**Queue đầy** (`QUEUE_MAXSIZE`): drop alert + log ERROR + thả dấu dedup, thay vì phình bộ nhớ đến khi OOM.
+**Queue đầy** (`QUEUE_MAXSIZE`): từ chối alert + log ERROR + thả dấu dedup + trả **HTTP 503**, thay vì phình bộ nhớ đến khi OOM. Alertmanager chỉ retry khi nhận 5xx, nên phải phân biệt rõ hai loại thất bại trong response:
+
+| Trường | Nghĩa | HTTP |
+|---|---|---|
+| `dropped` | payload dị dạng / không format được — lỗi **vĩnh viễn**, retry vô ích | 200 |
+| `rejected` | queue đầy — lỗi **tạm thời**, retry có ích | 503 |
+
+**Độ dài message**: Telegram cắt cứng ở 4096 ký tự và trả 400 nếu vượt — mà 400 bị coi là lỗi vĩnh viễn nên alert sẽ biến mất im lặng. Message luôn được cắt trước ở mức `MAX_MESSAGE_CHARS`, cắt theo **giá trị thô trước khi escape** để không làm hỏng entity MarkdownV2, và ưu tiên giữ phần đầu (Status/Alertname/Cấp độ/Máy chủ) cùng các mốc thời gian; phần bị lược có dòng đánh dấu ở cuối.
+
+**Tắt dịch vụ**: worker là daemon thread nên trước đây mỗi lần redeploy là mất sạch alert đang nằm trong queue. Nay khi tiến trình thoát, service chờ tối đa `SHUTDOWN_DRAIN_TIMEOUT` giây cho worker gửi nốt.
 
 **Message nhiều dòng:** annotation một dòng dùng inline code; annotation nhiều dòng bọc inline code **từng dòng riêng**:
 

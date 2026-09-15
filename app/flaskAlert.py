@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -44,6 +45,9 @@ from config import (
 # < ERROR, stderr nhan >= ERROR, va tat propagate de khong dup qua root logger.
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 # Log nguyen payload webhook rat to va co the chua thong tin nhay cam -> mac dinh tat.
+# Ban cu log payload bang app.logger.debug() trong khi logger mac dinh o muc INFO
+# -> bat LOG_PAYLOAD=1 mot minh KHONG in ra gi ca, phai nho dat them LOG_LEVEL=DEBUG.
+# LOG_PAYLOAD la mot lua chon co y cua nguoi van hanh nen log thang o muc INFO.
 LOG_PAYLOAD = os.environ.get('LOG_PAYLOAD', '').strip().lower() in ('1', 'true', 'yes')
 
 
@@ -72,6 +76,11 @@ app.logger.addHandler(_stdout_handler)
 app.logger.addHandler(_stderr_handler)
 app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 app.logger.propagate = False
+
+# Gioi han kich thuoc body webhook. Khong co han nay, mot POST khong lo (vo tinh
+# hay co y) duoc doc het vao RAM truoc khi parse JSON. Vuot han -> Flask tra 413.
+MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH_BYTES', 2 * 1024 * 1024))
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # ================== CHONG ALERT TRUNG ==================
 # TTLCache tu dong xoa entry sau ALERT_REPEAT_INTERVAL giay - khong bi memory leak
@@ -112,6 +121,22 @@ class AlertJob(NamedTuple):
 
 
 alert_queue: "queue.Queue[AlertJob]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
+
+# So job da roi khoi queue nhung CHUA gui xong. Queue rong khong co nghia la da
+# gui het - batch cuoi van dang bay. Dem nay de _drain_on_exit() biet cho them.
+_inflight = 0
+_inflight_lock = Lock()
+
+
+def _inflight_add(n):
+    global _inflight
+    with _inflight_lock:
+        _inflight += n
+
+
+def _pending_total():
+    with _inflight_lock:
+        return alert_queue.qsize() + _inflight
 
 # ================== BOT POOL ==================
 # Truoc day moi alert tao mot Bot() moi. Bot cua PTB v21 mo mot HTTPX
@@ -165,6 +190,8 @@ def _drain_queue():
             items.append(alert_queue.get_nowait())
     except queue.Empty:
         pass
+
+    _inflight_add(len(items))
     return items
 
 
@@ -188,7 +215,18 @@ async def _process_batch(items, handled):
     for job in items:
         chat_groups[(job.chat_id, job.thread_id)].append(job)
 
-    await asyncio.gather(*[_send_group(g, handled) for g in chat_groups.values()])
+    # return_exceptions=True: khong co return_exceptions, mot group nem loi
+    # se lam asyncio.gather CANCEL cac group con lai ngay giua chung - nhung
+    # chat khong lien quan mat alert oan. Gio moi group song chet doc lap.
+    results = await asyncio.gather(
+        *[_send_group(g, handled) for g in chat_groups.values()],
+        return_exceptions=True,
+    )
+    for key, result in zip(chat_groups.keys(), results):
+        if isinstance(result, BaseException):
+            app.logger.error(
+                f"Loi khi gui nhom chat {key[0]}: {result}", exc_info=result
+            )
 
 
 def background_worker():
@@ -207,16 +245,50 @@ def background_worker():
             loop.run_until_complete(_process_batch(items, handled))
         except Exception as e:
             app.logger.error(f"background_worker error: {e}", exc_info=True)
+        finally:
             # Chi tha dau dedup cua nhung job CHUA duoc xu ly. Ban cu tha ca
             # batch, ke ca job da gui thanh cong -> alert bi gui trung.
+            # Dat trong 'finally' vi tu khi _process_batch nuot exception
+            # (return_exceptions=True) thi nhanh 'except' khong con chay nua,
+            # ma job bi bo do van phai duoc tha ra.
             for job in items:
                 if job.alert_hash not in handled:
                     release_alert(job.alert_hash)
+            _inflight_add(-len(items))
 
 
 # Start background worker thread (daemon=True so it exits with main process)
 _worker_thread = Thread(target=background_worker, name='alert-sender', daemon=True)
 _worker_thread.start()
+
+
+# Worker la daemon thread -> bi giet ngay khi tien trinh thoat. Khong co buoc
+# nay thi moi lan redeploy / SIGTERM la mat sach nhung alert dang nam trong
+# queue. Doi toi da SHUTDOWN_DRAIN_TIMEOUT giay cho worker gui not.
+# Dat nho hon graceful_timeout cua gunicorn (30s) de gunicorn khong giet ngang.
+SHUTDOWN_DRAIN_TIMEOUT = float(os.environ.get('SHUTDOWN_DRAIN_TIMEOUT', 20))
+
+
+def _drain_on_exit():
+    pending = _pending_total()
+    if not pending:
+        return
+    if not _worker_thread.is_alive():
+        # Khong con ai gui thi cho cung vo ich - va se treo tien trinh them
+        # SHUTDOWN_DRAIN_TIMEOUT giay truoc khi gunicorn giet ngang.
+        app.logger.error(f"Shutdown: worker da chet, mat {pending} alert trong queue")
+        return
+    app.logger.info(f"Shutdown: cho gui not {pending} alert (toi da {SHUTDOWN_DRAIN_TIMEOUT}s)")
+    deadline = time.monotonic() + SHUTDOWN_DRAIN_TIMEOUT
+    while time.monotonic() < deadline:
+        if not _pending_total():
+            app.logger.info("Shutdown: da gui het alert trong queue")
+            return
+        time.sleep(0.2)
+    app.logger.error(f"Shutdown: con {_pending_total()} alert CHUA gui duoc")
+
+
+atexit.register(_drain_on_exit)
 # ===========================================================
 
 
@@ -330,6 +402,34 @@ def safe_code(text):
     return str(text).replace('\\', '\\\\').replace('`', '\\`')
 
 
+# Chan do dai cua MOT truong ngan (alertname, hostname, site, timestamp tho).
+# Mot label dai bat thuong khong duoc phep chiem het cho cua ca message: neu
+# dong do vuot TELEGRAM_HARD_LIMIT thi _fit_message se bo NGUYEN dong - alert
+# mat luon ten - hoac te hon, bo het moi dong va tra ve chuoi rong (Telegram
+# tra 400 cho message rong -> alert bi drop han).
+MAX_FIELD_CHARS = int(os.environ.get('MAX_FIELD_CHARS', 256))
+
+
+def _clip(text, limit=None):
+    """Cat mot truong ngan ve do dai an toan, TRUOC khi escape."""
+    limit = MAX_FIELD_CHARS if limit is None else limit
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
+def inline_code(text, limit=None):
+    """Mot doan inline code `...` an toan tren MOT dong.
+
+    MarkdownV2 cam ky tu xuong dong ben trong inline code. Mot label co '\\n'
+    (alertname, hostname, site... do quy tac Prometheus sinh ra) se lam vo cap
+    backtick -> Telegram tra 400 'can't parse entities' -> send_telegram_alert
+    coi 400 la loi vinh vien nen alert bi DROP han. Gop moi ky tu xuong dong
+    thanh dau cach de noi dung con nguyen ma message van parse duoc.
+    """
+    one_line = re.sub(r'[\r\n\t]+', ' ', _clip(text, limit))
+    return f"`{safe_code(one_line)}`"
+
+
 def _render_annotation(title, value):
     """Dinh dang mot annotation thanh (cac) dong cua message.
 
@@ -391,6 +491,21 @@ _ZERO_TS_PREFIX = '0001-01-01'
 # Dat '' de bo hoan toan.
 ANNOTATION_SUFFIX_RESOLVED = ' (lúc cảnh báo)'
 
+# Telegram cat cung o 4096 ky tu cho sendMessage. Vuot han -> BadRequest, ma
+# send_telegram_alert coi BadRequest la loi VINH VIEN nen alert bi drop va dau
+# dedup duoc giu nguyen -> canh bao bien mat hoan toan trong ALERT_REPEAT_INTERVAL.
+# Description cua alert Ceph/Loki rat de vuot 4096. Chua bien an toan cho phan
+# escape cua MarkdownV2 (moi ky tu dac biet ton them 1 ky tu).
+TELEGRAM_HARD_LIMIT = 4096
+MAX_MESSAGE_CHARS = min(
+    int(os.environ.get('MAX_MESSAGE_CHARS', 3800)), TELEGRAM_HARD_LIMIT
+)
+# Nam BEN TRONG inline code nen khong can escape MarkdownV2 - trong code entity
+# chi '`' va '\' moi phai escape.
+TRUNCATE_MARK = ' …(đã cắt bớt)'
+# Nam ngoai code entity -> phai escape.
+TRUNCATED_LINE = escape_md2('… (nội dung quá dài, đã lược bớt)')
+
 
 def _host_of(labels):
     """Ten may chu de hien thi: hostname -> host -> instance."""
@@ -412,8 +527,21 @@ def _parse_ts(raw):
         return None
 
 
+# Mui gio hien thi. Truoc day hardcode 'Asia/Bangkok' - cung offset +07 nen
+# gio hien ra van dung, nhung ten mui gio sai voi he thong dat tai Viet Nam.
+DISPLAY_TZ_NAME = os.environ.get('DISPLAY_TZ', 'Asia/Ho_Chi_Minh')
+try:
+    DISPLAY_TZ = pytz.timezone(DISPLAY_TZ_NAME)
+except pytz.UnknownTimeZoneError:
+    app.logger.error(
+        f"DISPLAY_TZ='{DISPLAY_TZ_NAME}' khong hop le - dung Asia/Ho_Chi_Minh"
+    )
+    DISPLAY_TZ_NAME = 'Asia/Ho_Chi_Minh'
+    DISPLAY_TZ = pytz.timezone(DISPLAY_TZ_NAME)
+
+
 def _fmt_ts(dt):
-    return dt.astimezone(pytz.timezone('Asia/Bangkok')).strftime('%Y-%m-%d %H:%M:%S')
+    return dt.astimezone(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
 def _ts_line(title, dt, raw):
@@ -425,10 +553,81 @@ def _ts_line(title, dt, raw):
     `title` khong duoc chua ky tu dac biet cua MarkdownV2.
     """
     if dt is not None:
-        return f"*{title}:* `{_fmt_ts(dt)}`"
+        return f"*{title}:* {inline_code(_fmt_ts(dt))}"
     if raw and not str(raw).startswith(_ZERO_TS_PREFIX):
-        return f"*{title}:* `{safe_code(raw)}`"
+        return f"*{title}:* {inline_code(raw)}"
     return None
+
+
+def _append_annotations(lines, annotations, suffix, budget):
+    """Them cac dong annotation vao `lines`, khong vuot `budget` ky tu.
+
+    Cat theo GIA TRI THO roi moi escape: cat sau khi escape co the dut doi mot
+    cap '\\x' hoac mot cap backtick -> Telegram tra 400 va alert bi drop han.
+    Cat truoc khi escape thi ket qua luon con la MarkdownV2 hop le.
+    """
+    truncated = False
+    for field, title in (('info', 'Info'), ('summary', 'Summary'),
+                         ('description', 'Description')):
+        value = annotations.get(field)
+        if value in (None, ''):
+            continue
+
+        title_md = escape_md2(title + suffix)
+        text = str(value)
+
+        # Escape chi lam chuoi DAI THEM, khong bao gio ngan di. Nen mot gia tri
+        # tho da dai hon ngan sach thi chac chan khong vua - khong can escape
+        # ca chuoi (co the vai MB) chi de do do dai roi vut di.
+        if len(text) <= budget:
+            rendered = _render_annotation(title_md, text)
+            if len(rendered) <= budget:
+                lines.append(rendered)
+                budget -= len(rendered) + 1  # +1 cho ky tu xuong dong
+                continue
+
+        # Khong vua: thu rut ngan dan gia tri tho cho lot ngan sach con lai.
+        # Do dai sau escape khong ty le tuyen tinh voi do dai tho (moi ky tu
+        # dac biet phinh them 1), nen do dan thay vi tinh mot phat.
+        keep = min(len(text), budget)
+        while keep > 0:
+            candidate = _render_annotation(title_md, text[:keep] + TRUNCATE_MARK)
+            if len(candidate) <= budget:
+                lines.append(candidate)
+                break
+            keep = keep * 3 // 4 if keep > 32 else keep - 16
+        truncated = True
+        break  # het ngan sach -> khong xet annotation con lai
+
+    if truncated:
+        lines.append(TRUNCATED_LINE)
+
+
+def _fit_message(lines):
+    """Chot chan cuoi cung: ghep `lines` sao cho khong vuot TELEGRAM_HARD_LIMIT.
+
+    Chi cat o RANH GIOI DONG. Moi dong do format_telegram_message sinh ra deu
+    tu dong (mo va dong day du cac entity MarkdownV2), nen cat theo dong khong
+    bao gio de lai entity ho.
+    """
+    out = []
+    total = 0
+    for line in lines:
+        extra = len(line) + (1 if out else 0)
+        if total + extra > TELEGRAM_HARD_LIMIT:
+            break
+        out.append(line)
+        total += extra
+
+    if not out:
+        # Khong dong nao lot - khong bao gio duoc tra ve chuoi rong: Telegram
+        # tra 400 cho message rong, ma 400 bi coi la loi vinh vien nen alert
+        # se bi drop im lang. Voi _clip o cac truong ngan thi nhanh nay gan
+        # nhu khong xay ra, nhung day la chot chan cuoi cung.
+        app.logger.error("Message vuot gioi han ngay tu dong dau - gui ban rut gon")
+        return TRUNCATED_LINE
+
+    return '\n'.join(out)
 
 
 def format_telegram_message(alert, labels, annotations):
@@ -437,14 +636,19 @@ def format_telegram_message(alert, labels, annotations):
     Tin FIRING : Status, Alertname, Cap do, May chu/Site, Summary,
                  Description, Bat dau.
     Tin RESOLVED: nhu tren nhung tieu de Summary/Description co them
-                 "(luc canh bao)", va dong thoi gian la Ket thuc.
+                 "(luc canh bao)", va co CA Bat dau lan Ket thuc.
     Status khac : in nguyen trang thai kem icon '?', khong gia vo la firing.
+
+    Do dai luon duoc chan duoi TELEGRAM_HARD_LIMIT - xem _append_annotations
+    va _fit_message.
 
     Summary/Description trong payload resolved la anh chup luc alert dang
     firing chu khong phai trang thai hien tai - do la ly do co hau to.
     """
     status = str(alert.get('status', '')).lower()
-    severity = str(labels.get('severity', '')).lower()
+    # _clip: severity cung den tu label ben ngoai. Mot severity dai bat thuong
+    # khong duoc phep an het ngan sach ky tu cua phan Summary/Description.
+    severity = _clip(labels.get('severity', '')).lower()
     is_resolved = status == 'resolved'
     is_firing = status == 'firing'
 
@@ -461,11 +665,14 @@ def format_telegram_message(alert, labels, annotations):
         status_text = 'ĐANG CẢNH BÁO'
     else:
         status_icon = STATUS_ICON_UNKNOWN
-        status_text = str(alert.get('status', '')).upper() or 'UNKNOWN'
+        # _clip: status la mot chuoi tu payload ben ngoai, khong co gi bao dam
+        # no ngan. Khong chan thi mot status dai bat thuong day ca dong Status
+        # vuot gioi han -> _fit_message bo dong do -> message RONG -> 400.
+        status_text = _clip(alert.get('status', '')).upper() or 'UNKNOWN'
 
     lines = [
         f"*Status:* {status_icon} {escape_md2(status_text)} {status_icon}",
-        f"*Alertname:* `{safe_code(labels.get('alertname', 'N/A'))}`",
+        f"*Alertname:* {inline_code(labels.get('alertname', 'N/A'))}",
     ]
 
     # Cap do: luon hien thi, ke ca khi da khoi phuc - nguoi doc can biet
@@ -481,9 +688,9 @@ def format_telegram_message(alert, labels, annotations):
     if host or site:
         parts = []
         if host:
-            parts.append(f"*Máy chủ:* `{safe_code(host)}`")
+            parts.append(f"*Máy chủ:* {inline_code(host)}")
         if site:
-            parts.append(f"*Site:* `{safe_code(site)}`")
+            parts.append(f"*Site:* {inline_code(site)}")
         lines.append(' · '.join(parts))
 
     # Tieu de PHAI escape truoc khi dua vao _render_annotation: ham do noi
@@ -492,29 +699,33 @@ def format_telegram_message(alert, labels, annotations):
     # "can't parse entities", va send_telegram_alert coi 400 la loi vinh vien
     # nen alert bi drop han, khong retry.
     suffix = ANNOTATION_SUFFIX_RESOLVED if is_resolved else ''
-    for field, title in (('info', 'Info'), ('summary', 'Summary'),
-                         ('description', 'Description')):
-        value = annotations.get(field)
-        if value in (None, ''):
-            continue
-        lines.append(_render_annotation(escape_md2(title + suffix), value))
 
+    # Dung phan duoi (thoi gian) TRUOC de biet con bao nhieu cho cho annotation.
     raw_start = alert.get('startsAt')
     raw_end = alert.get('endsAt')
     started = _parse_ts(raw_start)
     ended = _parse_ts(raw_end)
 
+    tail = []
+    start_line = _ts_line('Bắt đầu', started, raw_start)
+    if start_line:
+        tail.append(start_line)
     if is_resolved:
-        # Tin resolved chi can moc ket thuc.
-        line = _ts_line('Kết thúc', ended, raw_end)
-        if line:
-            lines.append(line)
-    else:
-        line = _ts_line('Bắt đầu', started, raw_start)
-        if line:
-            lines.append(line)
+        # Tin resolved phai co CA hai moc: "Bat dau" cho biet su co keo tu bao
+        # gio, "Ket thuc" cho biet luc nao het. Ban truoc bo mat dong "Bat dau"
+        # sau khi go "Keo dai" -> nguoi truc khong con biet do dai su co.
+        end_line = _ts_line('Kết thúc', ended, raw_end)
+        if end_line:
+            tail.append(end_line)
 
-    return '\n'.join(lines)
+    head_len = sum(len(x) + 1 for x in lines)
+    tail_len = sum(len(x) + 1 for x in tail)
+    # Tru them do dai TRUNCATED_LINE de con cho bao "da luoc bot" neu phai cat.
+    budget = MAX_MESSAGE_CHARS - head_len - tail_len - len(TRUNCATED_LINE) - 1
+    _append_annotations(lines, annotations, suffix, budget)
+
+    lines.extend(tail)
+    return _fit_message(lines)
 
 
 async def send_telegram_alert(bot_token, chat_id, message, thread_id=None, max_retries=3):
@@ -640,12 +851,17 @@ def resolve_destinations(labels):
 def health():
     """Cho HEALTHCHECK cua Docker / liveness probe. Khong can auth."""
     alive = _worker_thread.is_alive()
+    # TTLCache KHONG thread-safe: len() goi expire() - tuc la GHI vao cache.
+    # Doc khong lock trong khi worker/webhook dang ghi co the ra
+    # "RuntimeError: dictionary changed size during iteration".
+    with cache_lock:
+        cache_size = len(recent_alerts_cache)
     body = {
         'status': 'ok' if alive else 'degraded',
         'worker_alive': alive,
         'queue_size': alert_queue.qsize(),
         'queue_maxsize': QUEUE_MAXSIZE,
-        'dedup_cache_size': len(recent_alerts_cache),
+        'dedup_cache_size': cache_size,
         'rules_loaded': len(RULES),
         'default_bot_configured': bool(DEFAULT_BOT_TOKEN and DEFAULT_CHAT_ID),
     }
@@ -668,14 +884,16 @@ def alertmanager_webhook():
 
     app.logger.info("Webhook called")
     if LOG_PAYLOAD:
-        app.logger.debug(f"Received data: {json.dumps(data, default=str)}")
+        # Log o INFO chu khong DEBUG: xem ghi chu o dinh nghia LOG_PAYLOAD.
+        app.logger.info(f"Received data: {json.dumps(data, default=str)}")
 
     # Enqueue alerts cho background worker -> tra 200 ngay.
     # background_worker() drain queue voi rate limit (SEND_DELAY giua cac msg),
     # tranh gunicorn timeout va Alertmanager retry tren batch cham.
     queued = 0
     duplicates = 0
-    dropped = 0
+    dropped = 0     # loi VINH VIEN (payload di dang) - Alertmanager retry cung the
+    rejected = 0    # loi TAM THOI (queue day) - phai bao 5xx de duoc retry
 
     for alert in alerts:
         if not isinstance(alert, dict):
@@ -717,26 +935,37 @@ def alertmanager_webhook():
                 )
             except queue.Full:
                 app.logger.error(
-                    f"Queue day ({QUEUE_MAXSIZE}) - drop alert {labels.get('alertname')} "
+                    f"Queue day ({QUEUE_MAXSIZE}) - tu choi alert {labels.get('alertname')} "
                     f"-> chat {chat_id}. Telegram co the dang khong gui duoc; "
-                    "Alertmanager se retry"
+                    "tra 503 de Alertmanager retry"
                 )
                 release_alert(alert_hash)
-                dropped += 1
+                rejected += 1
                 continue
 
             queued += 1
 
     app.logger.info(
-        f"Queued {queued} alert(s), {duplicates} duplicate(s), {dropped} dropped"
+        f"Queued {queued} alert(s), {duplicates} duplicate(s), "
+        f"{dropped} dropped, {rejected} rejected"
     )
 
-    return jsonify({
-        'status': 'ok',
+    body = {
+        'status': 'ok' if not rejected else 'overloaded',
         'queued': queued,
         'duplicates': duplicates,
         'dropped': dropped,
-    }), 200
+        'rejected': rejected,
+    }
+
+    # Alertmanager CHI retry khi nhan 5xx. Ban cu tra 200 ke ca khi queue day
+    # -> alert bi tu choi im lang, phai doi het repeat_interval (thuong 4h)
+    # moi co co hoi gui lai. Phan biet ro hai loai that bai:
+    #   - rejected (queue day)  : loi tam thoi -> 503, retry co ich.
+    #   - dropped  (payload hong): loi vinh vien -> 200, retry chi lam lap vo han.
+    if rejected:
+        return jsonify(body), 503
+    return jsonify(body), 200
 
 
 if __name__ == '__main__':

@@ -16,6 +16,22 @@ def check(name, cond, detail=''):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}{(' -> ' + str(detail)) if detail and not cond else ''}")
 
 
+def check_call(name, fn, detail=''):
+    """Nhu check() nhung dieu kien duoc tinh trong fn().
+
+    Truoc day mot bieu thuc dieu kien nem exception (vd msg.index() khi chuoi
+    khong ton tai) lam CHET ca script -> moi muc test phia sau khong bao gio
+    chay, ma output nhin nhu chi co 1 loi nho. Gio exception = FAIL, chay tiep.
+    """
+    try:
+        cond = fn()
+    except Exception as e:
+        FAIL.append(name)
+        print(f"  FAIL  {name} -> EXCEPTION {type(e).__name__}: {e}")
+        return
+    check(name, cond, detail)
+
+
 def fresh(config_obj, **env):
     """Nap lai config + app voi mot telegram_config.json tam."""
     path = '/tmp/tg_cfg.json'
@@ -180,14 +196,168 @@ check("resolved danh dau annotation la anh chup luc canh bao",
       "*Summary \\(l\u00fac c\u1ea3nh b\u00e1o\\):*" in msg, msg)
 check("resolved VAN in dong Bat dau (vi da bo Keo dai)",
       "*B\u1eaft \u0111\u1ea7u:* `2026-09-07 17:00:00`" in msg, msg)
-check("resolved co du ca Bat dau lan Ket thuc, dung thu tu",
-      msg.index("B\u1eaft \u0111\u1ea7u") < msg.index("K\u1ebft th\u00fac"), msg)
+check_call("resolved co du ca Bat dau lan Ket thuc, dung thu tu",
+           lambda: msg.index("B\u1eaft \u0111\u1ea7u") < msg.index("K\u1ebft th\u00fac"), msg)
 check("may chu / site tach thanh truong rieng",
       "*M\u00e1y ch\u1ee7:* `rgw-02`" in msg and "*Site:* `hya`" in msg, msg)
 check("ham _fmt_duration da duoc go bo khoi module",
       not hasattr(fa, "_fmt_duration"))
 
+print("\n[4f] Chan do dai theo gioi han 4096 cua Telegram")
+huge = "x" * 9000
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "Big", "severity": "critical"},
+    {"description": huge})
+check("message khong vuot gioi han cung cua Telegram",
+      len(msg) <= fa.TELEGRAM_HARD_LIMIT, len(msg))
+check("co danh dau da luoc bot", fa.TRUNCATED_LINE in msg, msg[-200:])
+check("van giu nguyen phan dau (Status/Alertname)",
+      "*Alertname:* `Big`" in msg, msg[:200])
+check("dong thoi gian KHONG bi cat mat",
+      "*Bắt đầu:*" in msg, msg[-200:])
+
+# Escape phinh do dai: chuoi toan ky tu dac biet dai gap doi sau escape.
+msg = fa.format_telegram_message(
+    {"status": "resolved", "startsAt": "2026-09-07T10:00:00Z",
+     "endsAt": "2026-09-08T10:00:00Z"},
+    {"alertname": "Esc"}, {"summary": "`" * 6000, "description": "\\" * 6000})
+check("noi dung toan ky tu can escape van khong vuot gioi han",
+      len(msg) <= fa.TELEGRAM_HARD_LIMIT, len(msg))
+check("backtick trong phan bi cat van duoc escape doi (khong ho entity)",
+      msg.count("`") % 2 == 0 or "\\`" in msg, msg[:120])
+check("resolved dai van giu du ca 2 moc thoi gian",
+      "*Bắt đầu:*" in msg and "*Kết thúc:*" in msg, msg[-200:])
+
+# Nhieu annotation: cat tu Description, giu Summary ngan phia truoc.
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "Multi"}, {"summary": "ngan gon", "description": "y" * 9000})
+check("summary ngan van duoc giu nguyen khi description bi cat",
+      "*Summary:* `ngan gon`" in msg, msg[:300])
+
+t0 = time.time()
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "Huge"}, {"description": "*_[]()" * 300000})  # ~1.8MB toan ky tu escape
+dt = time.time() - t0
+check("annotation vai MB: cat nhanh, khong escape ca chuoi roi vut di",
+      dt < 1.0 and len(msg) <= fa.TELEGRAM_HARD_LIMIT, f"{dt:.2f}s len={len(msg)}")
+
+print("\n[4f2] Truong ngan bat thuong dai khong lam mat dong / rong message")
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "z" * 9000}, {"summary": "s"})
+check("alertname khong lo van con dong Alertname", "*Alertname:*" in msg, msg[:120])
+check("va van con Status + Summary",
+      "*Status:*" in msg and "*Summary:*" in msg, msg[:120])
+check("message khong vuot gioi han", len(msg) <= fa.TELEGRAM_HARD_LIMIT, len(msg))
+
+msg = fa.format_telegram_message({"status": "q" * 9000}, {"alertname": "A"}, {})
+check("status khong lo KHONG cho ra message rong (Telegram tra 400)",
+      msg != "" and len(msg) <= fa.TELEGRAM_HARD_LIMIT, repr(msg[:80]))
+check("va van giu duoc ten alert", "*Alertname:* `A`" in msg, msg[:200])
+
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "S", "severity": "w" * 9000}, {"summary": "van phai thay dong nay"})
+check("severity khong lo khong an het cho cua Summary",
+      "van phai th" in msg, msg[:300])
+
+print("\n[4g] Label chua newline khong pha inline code")
+msg = fa.format_telegram_message(
+    {"status": "firing", "startsAt": "2026-09-07T10:00:00Z"},
+    {"alertname": "A\nB", "hostname": "h1\nh2", "site": "s\r\ns2"}, {})
+for line in msg.split("\n"):
+    check_call(f"dong co so backtick chan: {line[:40]!r}",
+               lambda ln=line: ln.count("`") - ln.count("\\`") * 2 in (0, 2, 4))
+check("newline trong alertname bi gop thanh dau cach",
+      "*Alertname:* `A B`" in msg, msg)
+check("newline trong hostname bi gop thanh dau cach",
+      "*Máy chủ:* `h1 h2`" in msg, msg)
+
 # ============================================================
+print("\n[4h] Fuzz: message luon la MarkdownV2 hop le")
+# Day la lop loi nguy hiem nhat cua service: MarkdownV2 sai -> Telegram tra 400
+# -> send_telegram_alert coi la loi VINH VIEN -> alert bi drop va dau dedup
+# duoc GIU -> canh bao bien mat hoan toan, khong ai biet. Nen kiem bang may
+# thay vi doc bang mat.
+import random
+
+_SPECIAL = set('_[]()~>#+=|{}.!-')
+
+
+def md2_error(s):
+    """Tra ve mo ta loi dau tien, hoac None neu chuoi hop le.
+
+    Chi ho tro tap con ma format_telegram_message dung: *bold* va `code`.
+    """
+    i, n = 0, len(s)
+    in_code = False
+    bold = 0
+    while i < n:
+        c = s[i]
+        if c == '\\':
+            if i + 1 >= n:
+                return f"backslash treo o cuoi (pos {i})"
+            i += 2
+            continue
+        if c == '`':
+            in_code = not in_code
+            i += 1
+            continue
+        if in_code:
+            if c == '\n':
+                return f"xuong dong ben trong inline code (pos {i})"
+        else:
+            if c == '*':
+                bold += 1
+            elif c in _SPECIAL:
+                return f"ky tu dac biet '{c}' chua escape (pos {i})"
+        i += 1
+    if in_code:
+        return "inline code khong dong"
+    if bold % 2:
+        return "so dau '*' le - bold khong dong"
+    return None
+
+
+check("validator bat duoc loi that", md2_error("a (b)") is not None)
+check("validator chap nhan chuoi dung", md2_error("a \\(b\\) `c` *d*") is None,
+      md2_error("a \\(b\\) `c` *d*"))
+
+_CHARS = "abc \n\t\r`\\*_[]()~>#+=|{}.!-'\"đăâêôưĐ⛔…%$&@/:;,?<^"
+rnd = random.Random(20260915)
+
+
+def _rand_text(max_len):
+    return ''.join(rnd.choice(_CHARS) for _ in range(rnd.randint(0, max_len)))
+
+
+_bad = []
+for _ in range(3000):
+    alert = {
+        "status": rnd.choice(["firing", "resolved", "", "suppressed", _rand_text(12)]),
+        "startsAt": rnd.choice(["2026-09-07T10:00:00Z", "", "0001-01-01T00:00:00Z",
+                                _rand_text(20)]),
+        "endsAt": rnd.choice(["2026-09-10T14:13:20Z", "", "0001-01-01T00:00:00Z",
+                              _rand_text(20)]),
+    }
+    labels = {k: _rand_text(rnd.choice([10, 60, 400, 9000]))
+              for k in rnd.sample(["alertname", "severity", "hostname", "host",
+                                   "instance", "site"], rnd.randint(0, 6))}
+    annos = {k: _rand_text(rnd.choice([30, 300, 5000]))
+             for k in rnd.sample(["info", "summary", "description"], rnd.randint(0, 3))}
+    m = fa.format_telegram_message(alert, labels, annos)
+    err = md2_error(m)
+    if err or len(m) > fa.TELEGRAM_HARD_LIMIT or m == "":
+        _bad.append((err or f"len={len(m)} rong={m == ''}", alert, labels, annos))
+        if len(_bad) >= 3:
+            break
+
+check("3000 payload ngau nhien deu sinh MarkdownV2 hop le, <=4096, khong rong",
+      not _bad, _bad[:1])
+
 print("\n[5] Dedup reserve/release")
 a = {"fingerprint": "abc", "status": "firing", "startsAt": "2026-09-07T10:00:00Z"}
 dup1, h1 = fa.reserve_alert(a)
@@ -286,13 +456,98 @@ check("/health tra 200 + worker song", rv.status_code == 200 and body["worker_al
 check("/health khong can auth", rv.status_code != 401)
 check("/health bao so rule", body["rules_loaded"] == 3, body)
 
+print("\n[10b] /health doc dedup cache an toan khi co request song song")
+import threading
+_health_err = []
+
+
+def _hammer_health():
+    for _ in range(300):
+        try:
+            client.get("/health")
+        except Exception as e:      # RuntimeError: dict changed size
+            _health_err.append(e)
+            return
+
+
+def _hammer_reserve():
+    for i in range(3000):
+        fa.reserve_alert({"fingerprint": f"race{i}", "status": "firing",
+                          "startsAt": "2026-09-07T10:00:00Z"})
+
+
+ths = [threading.Thread(target=_hammer_health) for _ in range(3)]
+ths += [threading.Thread(target=_hammer_reserve) for _ in range(3)]
+for t in ths:
+    t.start()
+for t in ths:
+    t.join()
+check("/health + reserve chay song song khong nem RuntimeError",
+      not _health_err, _health_err[:1])
+
 print("\n[11] Queue co gioi han (bug #9)")
 cfg2, fa2 = fresh(modern, QUEUE_MAXSIZE="2", TELEGRAM_CONFIG_PATH='/tmp/tg_cfg.json')
 check("QUEUE_MAXSIZE doc tu env", fa2.alert_queue.maxsize == 2, fa2.alert_queue.maxsize)
 
+print("\n[11b] Queue day -> 503 de Alertmanager retry (khong nuot im lang)")
+# Chan worker lai bang cach cho send treo, roi bom cho tran queue.
+_block = threading.Event()
+
+
+async def slow_send(bot_token, chat_id, message, thread_id=None, max_retries=3):
+    _block.wait(10)
+    return fa2.SEND_OK
+
+
+fa2.send_telegram_alert = slow_send
+fa2.SEND_DELAY = 0
+client2 = fa2.app.test_client()
+
+burst = {"alerts": [
+    {"fingerprint": f"burst{i}", "status": "firing",
+     "startsAt": "2026-09-07T10:00:00Z",
+     "labels": {"site": "hpg", "product": "storage", "alertname": f"B{i}"},
+     "annotations": {}}
+    for i in range(40)]}
+rv = client2.post("/alert", json=burst, headers=hdr)
+body = rv.get_json()
+check("queue tran -> tra 503 chu khong 200", rv.status_code == 503, (rv.status_code, body))
+check("dem rieng 'rejected' cho loi tam thoi", body.get("rejected", 0) > 0, body)
+check("'dropped' khong bi dung cho queue day", body.get("dropped") == 0, body)
+_block.set()
+
+print("\n[11c] Payload di dang van tra 200 (retry vo ich)")
+rv = client2.post("/alert", json={"alerts": [None, 123]}, headers=hdr)
+body = rv.get_json()
+check("alert di dang -> dropped, KHONG phai rejected",
+      body.get("dropped") == 2 and body.get("rejected") == 0, body)
+check("va tra 200 de Alertmanager khong retry vo han", rv.status_code == 200, rv.status_code)
+
+print("\n[11d] LOG_PAYLOAD bat mot minh la co tac dung")
+check("LOG_PAYLOAD duoc doc", fa.LOG_PAYLOAD is False or fa.LOG_PAYLOAD is True)
+cfg3, fa3 = fresh(modern, LOG_PAYLOAD="1", TELEGRAM_CONFIG_PATH='/tmp/tg_cfg.json')
+check("LOG_PAYLOAD=1 khong con bi chan boi LOG_LEVEL=INFO",
+      fa3.LOG_PAYLOAD and fa3.app.logger.isEnabledFor(20), fa3.app.logger.level)
+import inspect as _inspect
+_src = _inspect.getsource(fa3.alertmanager_webhook)
+check("payload duoc log o muc INFO chu khong DEBUG",
+      "logger.info(f\"Received data" in _src, _src[:0])
+
+print("\n[11e] Gioi han kich thuoc body")
+check("MAX_CONTENT_LENGTH duoc set", fa3.app.config.get("MAX_CONTENT_LENGTH") > 0,
+      fa3.app.config.get("MAX_CONTENT_LENGTH"))
+cfg4, fa4 = fresh(modern, MAX_CONTENT_LENGTH_BYTES="512", TELEGRAM_CONFIG_PATH='/tmp/tg_cfg.json')
+rv = fa4.app.test_client().post(
+    "/alert", data=json.dumps({"alerts": [{"labels": {"a": "z" * 2000}}]}),
+    content_type="application/json", headers=hdr)
+check("body qua to -> 413 chu khong OOM", rv.status_code == 413, rv.status_code)
+
 print("\n[12] app:app va app.flaskAlert:app la cung mot app (bug #6)")
-import app as app_pkg
-check("gunicorn app:app khong con ra app rong", app_pkg.app is fa2.app)
+# Phai tu reload trong muc nay: moi lan fresh() o tren lai thay module 'app',
+# nen so sanh voi mot fa cu la so sanh nham doi tuong cua lan nap truoc.
+cfg5, fa5 = fresh(modern, TELEGRAM_CONFIG_PATH='/tmp/tg_cfg.json')
+app_pkg = importlib.import_module('app')
+check("gunicorn app:app khong con ra app rong", app_pkg.app is fa5.app)
 check("/alert dang ky tren app do", any(str(r) == "/alert" for r in app_pkg.app.url_map.iter_rules()))
 
 print(f"\n{'='*52}\n  PASS: {len(PASS)}   FAIL: {len(FAIL)}")
