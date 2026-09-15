@@ -402,7 +402,7 @@ def safe_code(text):
     return str(text).replace('\\', '\\\\').replace('`', '\\`')
 
 
-# Chan do dai cua MOT truong ngan (alertname, hostname, site, timestamp tho).
+# Chan do dai cua MOT truong ngan (alertname, severity, status, timestamp tho).
 # Mot label dai bat thuong khong duoc phep chiem het cho cua ca message: neu
 # dong do vuot TELEGRAM_HARD_LIMIT thi _fit_message se bo NGUYEN dong - alert
 # mat luon ten - hoac te hon, bo het moi dong va tra ve chuoi rong (Telegram
@@ -421,7 +421,7 @@ def inline_code(text, limit=None):
     """Mot doan inline code `...` an toan tren MOT dong.
 
     MarkdownV2 cam ky tu xuong dong ben trong inline code. Mot label co '\\n'
-    (alertname, hostname, site... do quy tac Prometheus sinh ra) se lam vo cap
+    (alertname, severity... do quy tac Prometheus sinh ra) se lam vo cap
     backtick -> Telegram tra 400 'can't parse entities' -> send_telegram_alert
     coi 400 la loi vinh vien nen alert bi DROP han. Gop moi ky tu xuong dong
     thanh dau cach de noi dung con nguyen ma message van parse duoc.
@@ -462,15 +462,18 @@ def _render_annotation(title, value):
 # sai han muc do nghiem trong.
 # Icon chon theo NGU NGHIA chu khong theo mau: doc duoc ca tren man hinh den
 # trang va voi nguoi mu mau do/cam - mau khong phai kenh thong tin duy nhat.
-SEVERITY_META = {
-    'critical': ('⛔', 'NGHIÊM TRỌNG'),
-    'major':    ('❗', 'CẢNH BÁO LỚN'),
-    'minor':    ('⚠️', 'CẢNH BÁO NHỎ'),
-    'warning':  ('🔹', 'NHẮC NHỞ'),
-    'info':     ('ℹ️', 'GHI NHẬN'),
+# Chi map severity -> icon. Ten tieng Viet (NGHIEM TRONG, CANH BAO LON...) da
+# duoc go: dong Severity in dung gia tri goc cua label, de khop voi ten severity
+# trong alert rule / Alertmanager va de grep.
+SEVERITY_ICONS = {
+    'critical': '⛔',
+    'major':    '❗',
+    'minor':    '⚠️',
+    'warning':  '🔹',
+    'info':     'ℹ️',
 }
 
-# Severity khong co trong SEVERITY_META (vd 'page', 'none', hoac rong). KHONG
+# Severity khong co trong SEVERITY_ICONS (vd 'page', 'none', hoac rong). KHONG
 # duoc lay icon cua muc 'info' lam mac dinh, khong thi mot alert dang firing voi
 # severity la se nhin y het mot ghi nhan vo thuong vo phat. Firing -> coi nhu
 # nghiem trong; resolved -> danh dau '?' vi cap do khong xac dinh.
@@ -489,7 +492,7 @@ _ZERO_TS_PREFIX = '0001-01-01'
 # Hau to gan vao tieu de Summary/Description trong tin RESOLVED. Noi dung hai
 # truong do la anh chup luc canh bao, khong phai trang thai hien tai.
 # Dat '' de bo hoan toan.
-ANNOTATION_SUFFIX_RESOLVED = ' (lúc cảnh báo)'
+ANNOTATION_SUFFIX_RESOLVED = ' (firing)'
 
 # Telegram cat cung o 4096 ky tu cho sendMessage. Vuot han -> BadRequest, ma
 # send_telegram_alert coi BadRequest la loi VINH VIEN nen alert bi drop va dau
@@ -503,17 +506,11 @@ MAX_MESSAGE_CHARS = min(
 # Nam BEN TRONG inline code nen khong can escape MarkdownV2 - trong code entity
 # chi '`' va '\' moi phai escape.
 TRUNCATE_MARK = ' …(đã cắt bớt)'
+# Ngan sach toi thieu de danh cho MOI annotation con lai khi mot annotation
+# truoc no phai cat. Khong co no thi Summary dai bat thuong nuot sach Description.
+MIN_ANNOTATION_CHARS = int(os.environ.get('MIN_ANNOTATION_CHARS', 120))
 # Nam ngoai code entity -> phai escape.
 TRUNCATED_LINE = escape_md2('… (nội dung quá dài, đã lược bớt)')
-
-
-def _host_of(labels):
-    """Ten may chu de hien thi: hostname -> host -> instance."""
-    for key in ('hostname', 'host', 'instance'):
-        value = labels.get(key)
-        if value:
-            return str(value)
-    return ''
 
 
 def _parse_ts(raw):
@@ -559,22 +556,50 @@ def _ts_line(title, dt, raw):
     return None
 
 
+def _fit_annotation(title_md, text, budget):
+    """Doan dai nhat cua `text` ma khi render van lot `budget`, hoac None.
+
+    Tim NHI PHAN thay vi rut 25% moi vong nhu ban cu: ban cu co the bo phi toi
+    mot phan tu ngan sach (vd chot o 2700 ky tu trong khi con cho toi 3600),
+    keo theo viec annotation phia sau bi bo han du van con cho.
+    Do dai sau escape tang don dieu theo do dai tho nen nhi phan dung; va vi
+    moi ung vien deu duoc do lai truoc khi nhan, ket qua khong bao gio vuot han.
+    """
+    lo, hi, best = 1, min(len(text), budget), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _render_annotation(title_md, text[:mid] + TRUNCATE_MARK)
+        if len(candidate) <= budget:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def _append_annotations(lines, annotations, suffix, budget):
     """Them cac dong annotation vao `lines`, khong vuot `budget` ky tu.
 
     Cat theo GIA TRI THO roi moi escape: cat sau khi escape co the dut doi mot
     cap '\\x' hoac mot cap backtick -> Telegram tra 400 va alert bi drop han.
     Cat truoc khi escape thi ket qua luon con la MarkdownV2 hop le.
+
+    Mot annotation phai cat KHONG lam dung viec xet nhung annotation sau no:
+    ban cu 'break' ngay, nen mot Summary dai bat thuong nuot sach Description -
+    truong thuong chua huong dan xu ly.
     """
+    fields = [(f, t) for f, t in (('info', 'Info'), ('summary', 'Summary'),
+                                  ('description', 'Description'))
+              if annotations.get(f) not in (None, '')]
+
     truncated = False
-    for field, title in (('info', 'Info'), ('summary', 'Summary'),
-                         ('description', 'Description')):
-        value = annotations.get(field)
-        if value in (None, ''):
-            continue
+    for idx, (field, title) in enumerate(fields):
+        if budget <= 0:
+            truncated = True
+            break
 
         title_md = escape_md2(title + suffix)
-        text = str(value)
+        text = str(annotations[field])
 
         # Escape chi lam chuoi DAI THEM, khong bao gio ngan di. Nen mot gia tri
         # tho da dai hon ngan sach thi chac chan khong vua - khong can escape
@@ -586,18 +611,16 @@ def _append_annotations(lines, annotations, suffix, budget):
                 budget -= len(rendered) + 1  # +1 cho ky tu xuong dong
                 continue
 
-        # Khong vua: thu rut ngan dan gia tri tho cho lot ngan sach con lai.
-        # Do dai sau escape khong ty le tuyen tinh voi do dai tho (moi ky tu
-        # dac biet phinh them 1), nen do dan thay vi tinh mot phat.
-        keep = min(len(text), budget)
-        while keep > 0:
-            candidate = _render_annotation(title_md, text[:keep] + TRUNCATE_MARK)
-            if len(candidate) <= budget:
-                lines.append(candidate)
-                break
-            keep = keep * 3 // 4 if keep > 32 else keep - 16
+        # Khong vua: chua lai mot phan ngan sach cho cac annotation phia sau.
+        # Neu chua lai roi ma chinh no khong con cho, thi dung het phan con lai.
+        reserve = MIN_ANNOTATION_CHARS * (len(fields) - idx - 1)
+        rendered = _fit_annotation(title_md, text, max(budget - reserve, 0))
+        if rendered is None:
+            rendered = _fit_annotation(title_md, text, budget)
+        if rendered is not None:
+            lines.append(rendered)
+            budget -= len(rendered) + 1
         truncated = True
-        break  # het ngan sach -> khong xet annotation con lai
 
     if truncated:
         lines.append(TRUNCATED_LINE)
@@ -633,11 +656,14 @@ def _fit_message(lines):
 def format_telegram_message(alert, labels, annotations):
     """Dung noi dung tin nhan Telegram.
 
-    Tin FIRING : Status, Alertname, Cap do, May chu/Site, Summary,
-                 Description, Bat dau.
+    Tin FIRING : Status, Alertname, Severity, Summary, Description, Bat dau.
     Tin RESOLVED: nhu tren nhung tieu de Summary/Description co them
-                 "(luc canh bao)", va co CA Bat dau lan Ket thuc.
+                 "(firing)", va moc thoi gian la Ket thuc thay cho Bat dau.
     Status khac : in nguyen trang thai kem icon '?', khong gia vo la firing.
+
+    NGOAI severity, KHONG label nao khac duoc dua vao tin nhan (truoc day co
+    them dong "May chu / Site"): chi tiet may chu, site, osd... da nam trong
+    Description do alert rule sinh ra, in lai o tren chi lam tin dai gap doi.
 
     Do dai luon duoc chan duoi TELEGRAM_HARD_LIMIT - xem _append_annotations
     va _fit_message.
@@ -652,17 +678,17 @@ def format_telegram_message(alert, labels, annotations):
     is_resolved = status == 'resolved'
     is_firing = status == 'firing'
 
-    sev_icon, sev_name = SEVERITY_META.get(severity, ('', ''))
+    sev_icon = SEVERITY_ICONS.get(severity, '')
     if not sev_icon:
         sev_icon = (SEVERITY_ICON_UNKNOWN_RESOLVED if is_resolved
                     else SEVERITY_ICON_UNKNOWN_FIRING)
 
     if is_resolved:
         status_icon = '✅'
-        status_text = 'ĐÃ KHÔI PHỤC'
+        status_text = 'RESOLVED'
     elif is_firing:
         status_icon = sev_icon
-        status_text = 'ĐANG CẢNH BÁO'
+        status_text = 'FIRING'
     else:
         status_icon = STATUS_ICON_UNKNOWN
         # _clip: status la mot chuoi tu payload ben ngoai, khong co gi bao dam
@@ -675,23 +701,11 @@ def format_telegram_message(alert, labels, annotations):
         f"*Alertname:* {inline_code(labels.get('alertname', 'N/A'))}",
     ]
 
-    # Cap do: luon hien thi, ke ca khi da khoi phuc - nguoi doc can biet
-    # su co vua roi nghiem trong den muc nao.
+    # Severity: luon hien thi, ke ca khi da khoi phuc - nguoi doc can biet
+    # su co vua roi nghiem trong den muc nao. In gia tri goc cua label
+    # (critical / major / ...), khong dich sang tieng Viet.
     if severity:
-        label = f"{sev_name} ({severity})" if sev_name else severity
-        lines.append(f"*Cấp độ:* {sev_icon} {escape_md2(label)}")
-
-    # May chu / site tach thanh truong rieng thay vi de lan trong cau van,
-    # de loc va tim nhanh.
-    host = _host_of(labels)
-    site = labels.get('site')
-    if host or site:
-        parts = []
-        if host:
-            parts.append(f"*Máy chủ:* {inline_code(host)}")
-        if site:
-            parts.append(f"*Site:* {inline_code(site)}")
-        lines.append(' · '.join(parts))
+        lines.append(f"*Severity:* {sev_icon} {escape_md2(severity)}")
 
     # Tieu de PHAI escape truoc khi dua vao _render_annotation: ham do noi
     # thang vao "*{title}:*", ma hau to "(luc canh bao)" co dau ngoac - ky tu
@@ -707,16 +721,16 @@ def format_telegram_message(alert, labels, annotations):
     ended = _parse_ts(raw_end)
 
     tail = []
-    start_line = _ts_line('Bắt đầu', started, raw_start)
-    if start_line:
-        tail.append(start_line)
     if is_resolved:
-        # Tin resolved phai co CA hai moc: "Bat dau" cho biet su co keo tu bao
-        # gio, "Ket thuc" cho biet luc nao het. Ban truoc bo mat dong "Bat dau"
-        # sau khi go "Keo dai" -> nguoi truc khong con biet do dai su co.
+        # Tin resolved chi in "Ket thuc". Moc bat dau da co trong tin firing
+        # gui truoc do, lap lai o day chi lam tin dai them.
         end_line = _ts_line('Kết thúc', ended, raw_end)
         if end_line:
             tail.append(end_line)
+    else:
+        start_line = _ts_line('Bắt đầu', started, raw_start)
+        if start_line:
+            tail.append(start_line)
 
     head_len = sum(len(x) + 1 for x in lines)
     tail_len = sum(len(x) + 1 for x in tail)

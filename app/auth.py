@@ -6,31 +6,33 @@ from flask_httpauth import HTTPBasicAuth
 
 auth = HTTPBasicAuth()
 
-_username = os.environ.get('BASIC_AUTH_USERNAME')
-_password = os.environ.get('BASIC_AUTH_PASSWORD')
+# Credentials mac dinh khi khong set env. Endpoint /alert nhan webhook tu ben
+# ngoai nen cap nay CHI hop le trong lab / noi bo; moi he thong dat that phai
+# set BASIC_AUTH_USERNAME va BASIC_AUTH_PASSWORD.
+DEFAULT_USERNAME = 'admin'
+DEFAULT_PASSWORD = 'admin@123'
 
-# Endpoint /alert nhan webhook tu ben ngoai. Truoc day thieu env la tu dong
-# chay bang admin/admin@123 - cap nay con duoc in ca trong README. Gio la
-# fail-fast; ai thuc su muon giu mac dinh phai bat ALLOW_INSECURE_AUTH=true.
-_allow_insecure = os.environ.get('ALLOW_INSECURE_AUTH', '').strip().lower() in ('1', 'true', 'yes')
+_username = os.environ.get('BASIC_AUTH_USERNAME') or ''
+_password = os.environ.get('BASIC_AUTH_PASSWORD') or ''
 
-if not _username or not _password:
-    if not _allow_insecure:
-        print(
-            "[FATAL] auth: BASIC_AUTH_USERNAME / BASIC_AUTH_PASSWORD chua duoc set. "
-            "Dat hai bien nay, hoac dat ALLOW_INSECURE_AUTH=true de chap nhan "
-            "credentials mac dinh admin/admin@123 (KHONG dung cho production).",
-            file=sys.stderr, flush=True
-        )
-        raise SystemExit(1)
+# Hai bien deu khong bat buoc: thieu bien nao thi bien do lay mac dinh. Van in
+# canh bao ra stderr de khong ai vo tinh chay production bang admin/admin@123
+# ma khong biet.
+_missing = []
+if not _username:
+    _username = DEFAULT_USERNAME
+    _missing.append('BASIC_AUTH_USERNAME')
+if not _password:
+    _password = DEFAULT_PASSWORD
+    _missing.append('BASIC_AUTH_PASSWORD')
 
+if _missing:
     print(
-        "[WARNING] auth: dang dung credentials mac dinh admin/admin@123 vi "
-        "ALLOW_INSECURE_AUTH=true - KHONG an toan cho production!",
+        "[WARNING] auth: chua set " + " / ".join(_missing) +
+        f" - dang dung mac dinh {DEFAULT_USERNAME}/{DEFAULT_PASSWORD}. "
+        "KHONG an toan cho production, hay set hai bien nay.",
         file=sys.stderr, flush=True
     )
-    _username = _username or 'admin'
-    _password = _password or 'admin@123'
 
 _username_b = _username.encode('utf-8')
 _password_b = _password.encode('utf-8')

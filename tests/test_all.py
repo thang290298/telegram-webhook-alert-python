@@ -131,8 +131,11 @@ check("summary mot dong van dung inline code", "*Summary:* `one line`" in msg, m
 check("alertname boc inline code (khong con escape_md2)",
       "*Alertname:* `Disk-Full`" in msg, msg)
 check("timestamp doi ve gio VN", "2026-09-07 17:00:00" in msg, msg)
-check("firing hien thi cap do theo severity",
-      "*C\u1ea5p \u0111\u1ed9:* \u26d4 NGHI\u00caM TR\u1eccNG \\(critical\\)" in msg, msg)
+check("firing hien thi Severity bang gia tri goc cua label",
+      "*Severity:* \u26d4 critical" in msg, msg)
+check("khong con ten tieng Viet cua cap do",
+      "NGHI\u00caM TR\u1eccNG" not in msg and "C\u1ea5p \u0111\u1ed9" not in msg, msg)
+check("firing in dong Bat dau", "*B\u1eaft \u0111\u1ea7u:*" in msg, msg)
 
 msg = fa.format_telegram_message(
     {"status": "resolved", "endsAt": "2026-09-07T10:00:00Z"}, {},
@@ -144,13 +147,13 @@ print("\n[4b] Status khong phai firing/resolved (muc 2)")
 msg = fa.format_telegram_message({}, {}, {})
 check("alert thieu 'status' khong con KeyError (bug #5)", "UNKNOWN" in msg, msg)
 check("status rong KHONG bi bao nham la dang canh bao",
-      "\u0110ANG C\u1ea2NH B\u00c1O" not in msg, msg)
+      "FIRING" not in msg, msg)
 
 msg = fa.format_telegram_message(
     {"status": "suppressed", "startsAt": "2026-09-07T10:00:00Z"},
     {"alertname": "S"}, {})
 check("status la -> in nguyen trang thai, khong gia vo la firing",
-      "SUPPRESSED" in msg and "\u0110ANG C\u1ea2NH B\u00c1O" not in msg, msg)
+      "SUPPRESSED" in msg and "FIRING" not in msg, msg)
 
 print("\n[4c] Fallback icon khi severity ngoai bang (muc 5)")
 msg = fa.format_telegram_message(
@@ -190,18 +193,19 @@ msg = fa.format_telegram_message(
     {"alertname": "R", "severity": "major", "hostname": "rgw-02", "site": "hya"},
     {"summary": "s"})
 check("resolved co dong Ket thuc",
-      "*K\u1ebft th\u00fac:* `2026-09-10 21:13:20`" in msg, msg)
-check("da bo han dong Keo dai", "K\u00e9o d\u00e0i" not in msg, msg)
+      "*Kết thúc:* `2026-09-10 21:13:20`" in msg, msg)
+check("da bo han dong Keo dai", "Kéo dài" not in msg, msg)
 check("resolved danh dau annotation la anh chup luc canh bao",
-      "*Summary \\(l\u00fac c\u1ea3nh b\u00e1o\\):*" in msg, msg)
-check("resolved VAN in dong Bat dau (vi da bo Keo dai)",
-      "*B\u1eaft \u0111\u1ea7u:* `2026-09-07 17:00:00`" in msg, msg)
-check_call("resolved co du ca Bat dau lan Ket thuc, dung thu tu",
-           lambda: msg.index("B\u1eaft \u0111\u1ea7u") < msg.index("K\u1ebft th\u00fac"), msg)
-check("may chu / site tach thanh truong rieng",
-      "*M\u00e1y ch\u1ee7:* `rgw-02`" in msg and "*Site:* `hya`" in msg, msg)
+      "*Summary \\(firing\\):*" in msg, msg)
+check("resolved KHONG in dong Bat dau nua",
+      "Bắt đầu" not in msg, msg)
+check("resolved hien Status RESOLVED", "✅ RESOLVED ✅" in msg, msg)
+check("may chu / site KHONG con la truong rieng",
+      "Máy chủ" not in msg and "Site" not in msg, msg)
 check("ham _fmt_duration da duoc go bo khoi module",
       not hasattr(fa, "_fmt_duration"))
+check("ham _host_of da duoc go bo khoi module",
+      not hasattr(fa, "_host_of"))
 
 print("\n[4f] Chan do dai theo gioi han 4096 cua Telegram")
 huge = "x" * 9000
@@ -226,8 +230,8 @@ check("noi dung toan ky tu can escape van khong vuot gioi han",
       len(msg) <= fa.TELEGRAM_HARD_LIMIT, len(msg))
 check("backtick trong phan bi cat van duoc escape doi (khong ho entity)",
       msg.count("`") % 2 == 0 or "\\`" in msg, msg[:120])
-check("resolved dai van giu du ca 2 moc thoi gian",
-      "*Bắt đầu:*" in msg and "*Kết thúc:*" in msg, msg[-200:])
+check("resolved dai van giu duoc moc Ket thuc",
+      "*Kết thúc:*" in msg, msg[-200:])
 
 # Nhieu annotation: cat tu Description, giu Summary ngan phia truoc.
 msg = fa.format_telegram_message(
@@ -273,8 +277,8 @@ for line in msg.split("\n"):
                lambda ln=line: ln.count("`") - ln.count("\\`") * 2 in (0, 2, 4))
 check("newline trong alertname bi gop thanh dau cach",
       "*Alertname:* `A B`" in msg, msg)
-check("newline trong hostname bi gop thanh dau cach",
-      "*Máy chủ:* `h1 h2`" in msg, msg)
+check("hostname / site khong con duoc dua vao tin nhan",
+      "h1" not in msg and "s2" not in msg, msg)
 
 # ============================================================
 print("\n[4h] Fuzz: message luon la MarkdownV2 hop le")
@@ -448,6 +452,47 @@ check("username unicode khong lam crash compare_digest",
       client.post("/alert", json=payload,
                   headers={"Authorization": "Basic " + base64.b64encode("nguyễn:p".encode()).decode()}
                   ).status_code == 401)
+
+print("\n[9b] BASIC_AUTH khong bat buoc -> mac dinh admin/admin@123")
+# Truoc day thieu env la process tu thoat (SystemExit) tru khi bat
+# ALLOW_INSECURE_AUTH. Gio thieu env chi la canh bao, service van len.
+_saved_auth_env = {k: os.environ.pop(k, None)
+                   for k in ('BASIC_AUTH_USERNAME', 'BASIC_AUTH_PASSWORD')}
+# Giu lai module object dang chay: cac muc test sau van dung `fa` / `client`
+# cua ban da import, khong duoc de sys.modules tro ve module moi.
+_saved_mods = {m: sys.modules.get(m)
+               for m in ('config', 'app', 'app.auth', 'app.flaskAlert')}
+try:
+    for m in _saved_mods:
+        sys.modules.pop(m, None)
+    _auth = importlib.import_module('app.auth')
+    check("thieu ca hai env -> import duoc, khong SystemExit", True)
+    check("mac dinh dung admin/admin@123",
+          _auth.verify_password('admin', 'admin@123') == 'admin')
+    check("sai password van bi tu choi",
+          _auth.verify_password('admin', 'sai') is None)
+
+    # Chi set moi username -> password lay mac dinh, va nguoc lai.
+    os.environ['BASIC_AUTH_USERNAME'] = 'chiuser'
+    sys.modules.pop('app.auth', None)
+    sys.modules.pop('app', None)
+    _auth = importlib.import_module('app.auth')
+    check("chi set username -> password van la mac dinh",
+          _auth.verify_password('chiuser', 'admin@123') == 'chiuser')
+    check("username mac dinh khong con dung khi da set env",
+          _auth.verify_password('admin', 'admin@123') is None)
+except SystemExit as e:
+    check("thieu env KHONG duoc lam process thoat", False, f"SystemExit {e.code}")
+finally:
+    os.environ.pop('BASIC_AUTH_USERNAME', None)
+    for k, v in _saved_auth_env.items():
+        if v is not None:
+            os.environ[k] = v
+    for m, mod in _saved_mods.items():
+        if mod is not None:
+            sys.modules[m] = mod
+        else:
+            sys.modules.pop(m, None)
 
 print("\n[10] /health")
 rv = client.get("/health")

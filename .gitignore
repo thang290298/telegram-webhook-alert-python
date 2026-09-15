@@ -9,3 +9,6 @@ venv/
 # Config that chua BOT_TOKEN - khong bao gio commit.
 # Dung telegram_config.example.json lam mau.
 telegram_config.json
+
+# Thu muc lam viec cua Claude - khong thuoc source cua service.
+Claude outputs/
