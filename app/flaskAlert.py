@@ -724,11 +724,11 @@ def format_telegram_message(alert, labels, annotations):
     if is_resolved:
         # Tin resolved chi in "Ket thuc". Moc bat dau da co trong tin firing
         # gui truoc do, lap lai o day chi lam tin dai them.
-        end_line = _ts_line('Kết thúc', ended, raw_end)
+        end_line = _ts_line('Resolved', ended, raw_end)
         if end_line:
             tail.append(end_line)
     else:
-        start_line = _ts_line('Bắt đầu', started, raw_start)
+        start_line = _ts_line('Started', started, raw_start)
         if start_line:
             tail.append(start_line)
 
